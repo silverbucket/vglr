@@ -429,17 +429,18 @@ class VGLRApp(mglw.WindowConfig):
             br, mr, tr, bt = (_bands['bass'], _bands['mid'],
                                _bands['treble'], _bands['beat'])
 
-        # Fader = max effect ceiling at full volume.
-        # Audio energy drives the wet/dry intensity: quiet → clean, loud → effect.
-        ceiling     = _slot_intensity * _m_master
+        # Track fader = base/floor effect (always-on glitch even at silence).
+        # Master fader = audio sensitivity (how much loud audio adds on top).
+        # intensity = base + audio_energy × (1 - base) × sensitivity
+        base        = _slot_intensity
+        sensitivity = _m_master
         raw_energy  = min(br * 2.5 + mr * 0.8 + tr * 0.4, 1.0)
-        # Snappy attack, slow release — intensity lingers after a loud hit
+        # Snappy attack, slow release so intensity lingers after a loud hit
         rate = 0.4 if raw_energy > self._smooth_energy else 0.08
         self._smooth_energy += rate * (raw_energy - self._smooth_energy)
-        intensity = self._smooth_energy * ceiling
+        intensity = min(base + self._smooth_energy * (1.0 - base) * sensitivity, 1.0)
 
-        # Raw audio values go to the shader for parameter modulation (full 0-1 range).
-        # Not scaled by ceiling so the internal effect character is always responsive.
+        # Raw audio values go to shaders for parameter modulation (full 0-1 range).
         bass   = float(br)
         mid    = float(mr)
         treble = float(tr)
@@ -447,8 +448,7 @@ class VGLRApp(mglw.WindowConfig):
 
         if self._audio_timer >= 1.0:
             print(f"bass={bass:.3f}  mid={mid:.3f}  treble={treble:.3f}  "
-                  f"beat={beat:.3f}  lvl={raw_energy:.2f}  "
-                  f"ceil={ceiling:.2f}  fx={intensity:.3f}")
+                  f"beat={beat:.3f}  lvl={self._smooth_energy:.2f}  fx={intensity:.3f}")
             self._audio_timer = 0.0
 
         _set_uniform(self.prog, 'resolution', self.wnd.size)
