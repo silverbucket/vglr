@@ -88,7 +88,7 @@ def _find_video(bank: int, slot: int) -> str | None:
     if not os.path.isdir(d):
         return None
     for f in sorted(os.listdir(d)):
-        if f.lower().endswith(('.mp4', '.mkv', '.mov')):
+        if not f.startswith('.') and f.lower().endswith(('.mp4', '.mkv', '.mov')):
             return os.path.join(d, f)
     return None
 
