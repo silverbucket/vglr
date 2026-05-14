@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vglr — step 5d: VHS shader with audio-reactive uniforms."""
+"""vglr — multi-shader audio-reactive video player."""
 import queue
 import threading
 import numpy as np
@@ -8,15 +8,28 @@ import moderngl_window as mglw
 import av
 import sounddevice as sd
 
-VIDEO_PATH  = 'videos/fb_rev_wet_mop_reimagined.mp4'
-SHADER_PATH = 'shaders/vhs.glsl'
-AUDIO_DEVICE = 1  # Zoom F1: USB Audio (hw:2,0)
+VIDEO_PATH   = 'videos/fb_rev_wet_mop_reimagined.mp4'
+AUDIO_DEVICE = 1      # Zoom F1: USB Audio (hw:2,0)
 SAMPLE_RATE  = 44100
 BLOCK_SIZE   = 1024
 GAIN         = 50.0   # scale FFT into 0-1; tune to mic level
-SMOOTH       = 0.3    # exponential smoothing (higher = faster response)
-BEAT_THRESH  = 1.8    # energy ratio above smoothed average to trigger beat
-BEAT_DECAY   = 0.85   # beat value decay per audio callback (~23ms)
+SMOOTH       = 0.3    # exponential smoothing
+BEAT_THRESH  = 1.8    # energy ratio to trigger beat
+BEAT_DECAY   = 0.85   # beat decay per audio callback
+
+# Shaders (keyboard 1/2/3 to switch)
+SHADERS = [
+    'shaders/vhs.glsl',
+    'shaders/block_glitch.glsl',
+    'shaders/passthrough.glsl',
+]
+
+# Default param_a/b/c per shader (knob A=intensity, B=color fx, C=density/dryness)
+SHADER_DEFAULTS = [
+    {'param_a': 0.5, 'param_b': 0.4, 'param_c': 0.4},  # vhs
+    {'param_a': 0.4, 'param_b': 0.5, 'param_c': 0.4},  # block_glitch
+    {'param_a': 0.0, 'param_b': 0.0, 'param_c': 0.0},  # passthrough
+]
 
 # Read video metadata before GL init
 with av.open(VIDEO_PATH) as _c:
@@ -25,6 +38,7 @@ with av.open(VIDEO_PATH) as _c:
     VIDEO_FPS = float(_s.average_rate or _s.guessed_rate or 30)
 
 print(f"video: {VIDEO_W}x{VIDEO_H} @ {VIDEO_FPS:.3f} fps")
+print("keys: 1=VHS  2=block_glitch  3=passthrough  Q=quit")
 
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
@@ -62,6 +76,13 @@ def decode_loop(path: str) -> None:
                 frame_queue.put(frame.to_ndarray(format='rgb24'), block=True)
 
 
+def set_uniform(prog, name, value):
+    try:
+        prog[name] = value
+    except KeyError:
+        pass
+
+
 VERT = """
 #version 140
 in vec2 in_position;
@@ -88,14 +109,11 @@ class VGLRApp(mglw.WindowConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        with open(SHADER_PATH) as f:
-            frag = f.read()
-        self.prog = self.ctx.program(vertex_shader=VERT, fragment_shader=frag)
         vbo = self.ctx.buffer(QUAD)
-        self.vao = self.ctx.vertex_array(self.prog, [(vbo, '2f', 'in_position')])
+        self._vbo = vbo
         self.texture = self.ctx.texture((VIDEO_W, VIDEO_H), 3)
-        self.prog['video'] = 0
-        self.texture.use(location=0)
+        self.shader_idx = 0
+        self._load_shader(0)
         self.frame_interval  = 1.0 / VIDEO_FPS
         self.last_frame_time = 0.0
         self._fps_frames     = 0
@@ -107,6 +125,22 @@ class VGLRApp(mglw.WindowConfig):
             blocksize=BLOCK_SIZE, device=AUDIO_DEVICE, callback=audio_callback,
         )
         self._stream.start()
+
+    def _load_shader(self, idx: int):
+        path = SHADERS[idx]
+        with open(path) as f:
+            frag = f.read()
+        if hasattr(self, 'prog'):
+            self.prog.release()
+        self.prog = self.ctx.program(vertex_shader=VERT, fragment_shader=frag)
+        self.vao = self.ctx.vertex_array(self.prog, [(self._vbo, '2f', 'in_position')])
+        set_uniform(self.prog, 'video', 0)
+        self.texture.use(location=0)
+        self.shader_idx = idx
+        defaults = SHADER_DEFAULTS[idx]
+        for k, v in defaults.items():
+            set_uniform(self.prog, k, v)
+        print(f"shader: {path}")
 
     def on_render(self, time, frametime):
         self._fps_frames += 1
@@ -130,12 +164,12 @@ class VGLRApp(mglw.WindowConfig):
                 float(_bands['treble']), float(_bands['beat']),
             )
 
-        self.prog['resolution'] = self.wnd.size
-        self.prog['time']       = time
-        self.prog['bass']       = bass
-        self.prog['mid']        = mid
-        self.prog['treble']     = treble
-        self.prog['beat']       = beat
+        set_uniform(self.prog, 'resolution', self.wnd.size)
+        set_uniform(self.prog, 'time',       time)
+        set_uniform(self.prog, 'bass',       bass)
+        set_uniform(self.prog, 'mid',        mid)
+        set_uniform(self.prog, 'treble',     treble)
+        set_uniform(self.prog, 'beat',       beat)
 
         self.ctx.clear()
         if time - self.last_frame_time >= self.frame_interval:
@@ -148,8 +182,16 @@ class VGLRApp(mglw.WindowConfig):
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
     def key_event(self, key, action, modifiers):
-        if action == self.wnd.keys.ACTION_PRESS and key == self.wnd.keys.Q:
+        if action != self.wnd.keys.ACTION_PRESS:
+            return
+        if key == self.wnd.keys.Q:
             self.wnd.close()
+        elif key == ord('1'):
+            self._load_shader(0)
+        elif key == ord('2'):
+            self._load_shader(1)
+        elif key == ord('3'):
+            self._load_shader(2)
 
 
 if __name__ == '__main__':
