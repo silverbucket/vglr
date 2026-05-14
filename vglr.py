@@ -28,11 +28,16 @@ BEAT_DECAY   = 0.85
 
 FALLBACK_VIDEO = 'videos/fb_rev_wet_mop_reimagined.mp4'
 
-# ── shaders (name, path) ──────────────────────────────────────────────────────
+# ── shaders (name, path) — 8 slots map to 8 Mute buttons ─────────────────────
 SHADERS = [
     ('vhs',         'shaders/vhs.glsl'),
     ('block_glitch','shaders/block_glitch.glsl'),
-    ('clean',       'shaders/passthrough.glsl'),
+    ('kaleidoscope','shaders/kaleidoscope.glsl'),
+    ('vortex',      'shaders/vortex.glsl'),
+    ('rgb_orbit',   'shaders/rgb_orbit.glsl'),
+    ('pixel_sort',  'shaders/pixel_sort.glsl'),
+    ('contour',     'shaders/contour.glsl'),
+    ('melt',        'shaders/melt.glsl'),
 ]
 
 # ── AKAI MIDI Mix factory mapping ─────────────────────────────────────────────
@@ -41,12 +46,25 @@ MUTE      = [1,  4,  7,  10, 13, 16, 19, 22]   # Mute notes, strips 1-8
 SOLO      = 27
 BANK_L    = 25
 BANK_R    = 26
-FADER_CC  = [19, 23, 27, 31, 49, 53, 57, 61]   # fader CC, strips 1-8
-KNOB_CC   = [                                    # [SendA, SendB, SendC] per strip
+FADER_CC  = [19, 23, 27, 31, 49, 53, 57, 61]
+KNOB_CC   = [
     [16, 17, 18], [20, 21, 22], [24, 25, 26], [28, 29, 30],
     [46, 47, 48], [50, 51, 52], [54, 55, 56], [58, 59, 60],
 ]
 MASTER_CC = 62
+
+# ── per-bank OSD colours (shown as brief flash on bank change) ────────────────
+BANK_COLORS = [
+    (1.0, 0.25, 0.25),  # bank1  red
+    (0.25, 0.45, 1.0),  # bank2  blue
+    (0.25, 1.0,  0.35), # bank3  green
+    (1.0, 1.0,  0.20),  # bank4  yellow
+    (1.0, 0.25, 1.0),   # bank5  magenta
+    (0.20, 1.0,  1.0),  # bank6  cyan
+    (1.0, 0.55, 0.10),  # bank7  orange
+    (0.90, 0.90, 0.90), # bank8  white
+]
+OSD_DURATION = 2.0     # seconds the bank flash is visible
 
 # ── per-slot defaults ─────────────────────────────────────────────────────────
 _DEFAULT_SETTINGS = {
@@ -72,8 +90,11 @@ _shader_req       = None   # render thread picks this up each frame
 _midi_out         = None
 
 # ── video state ───────────────────────────────────────────────────────────────
-_requested_video = None   # decode thread polls; None = wait
-_new_fps         = None   # render thread updates frame_interval when set
+_requested_video = None
+_new_fps         = None    # render thread updates frame_interval when set
+
+# ── OSD state (set by MIDI thread, consumed by render thread) ─────────────────
+_osd_trigger     = None    # (r, g, b) colour tuple; render thread starts timer
 
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
@@ -133,8 +154,8 @@ def _apply_settings(cfg: dict) -> None:
     _shader_req = idx
 
 
-def _select_slot(bank: int, slot: int) -> None:
-    global _current_bank, _current_slot, _requested_video
+def _select_slot(bank: int, slot: int, flash_osd: bool = False) -> None:
+    global _current_bank, _current_slot, _requested_video, _osd_trigger
     _current_bank = bank
     _current_slot = slot
     _apply_settings(_load_settings(bank, slot))
@@ -145,6 +166,8 @@ def _select_slot(bank: int, slot: int) -> None:
     else:
         print(f"slot: bank{bank}/video{slot}  (no video)")
     print(f"  shader={SHADERS[_slot_shader_idx][0]}  intensity={_slot_intensity:.2f}")
+    if flash_osd:
+        _osd_trigger = BANK_COLORS[(bank - 1) % len(BANK_COLORS)]
     if _midi_out:
         _slot_leds(slot)
         _effect_leds(_slot_shader_idx)
@@ -158,13 +181,11 @@ def _set_led(note: int, on: bool) -> None:
 
 
 def _slot_leds(active: int) -> None:
-    """Light the Rec ARM LED for the active slot (1-indexed), clear the rest."""
     for i, note in enumerate(RECARM):
         _set_led(note, (i + 1) == active)
 
 
 def _effect_leds(active_idx: int) -> None:
-    """Light the Mute LED for the active shader index, clear the rest."""
     for i, note in enumerate(MUTE[:len(SHADERS)]):
         _set_led(note, i == active_idx)
 
@@ -178,12 +199,10 @@ def _handle_midi(msg) -> None:
         if msg.type == 'note_off' or msg.velocity == 0:
             return
         note = msg.note
-        # Rec ARM 1-8 → select video slot
         for i, n in enumerate(RECARM):
             if note == n:
                 _select_slot(_current_bank, i + 1)
                 return
-        # Mute 1-N → select shader/effect
         for i, n in enumerate(MUTE[:len(SHADERS)]):
             if note == n:
                 _slot_shader_idx = i
@@ -191,15 +210,15 @@ def _handle_midi(msg) -> None:
                 _effect_leds(i)
                 return
         if note == BANK_L:
-            _select_slot(max(1, _current_bank - 1), _current_slot)
+            _select_slot(max(1, _current_bank - 1), _current_slot, flash_osd=True)
         elif note == BANK_R:
-            _select_slot(_current_bank + 1, _current_slot)
+            _select_slot(_current_bank + 1, _current_slot, flash_osd=True)
         elif note == SOLO:
             _save_settings(_current_bank, _current_slot)
 
     elif msg.type == 'control_change':
         cc, v = msg.control, msg.value
-        si = _current_slot - 1  # 0-indexed strip
+        si = _current_slot - 1
         if cc == FADER_CC[si]:
             _slot_intensity = v / 127.0
         elif cc == KNOB_CC[si][0]:
@@ -256,6 +275,9 @@ def _decode_loop() -> None:
             for frame in container.decode(video=0):
                 if _requested_video != current:
                     break
+                # Rescale if this video differs from the initial texture size
+                if frame.width != _init_w or frame.height != _init_h:
+                    frame = frame.reformat(width=_init_w, height=_init_h)
                 try:
                     frame_queue.put(frame.to_ndarray(format='rgb24'),
                                     block=True, timeout=0.5)
@@ -302,6 +324,13 @@ void main() {
 }
 """
 
+_OSD_FRAG = """
+#version 140
+uniform vec4 osd_color;
+out vec4 fragColor;
+void main() { fragColor = osd_color; }
+"""
+
 QUAD = np.array([-1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0], dtype='f4')
 
 
@@ -321,21 +350,35 @@ class VGLRApp(mglw.WindowConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._vbo = self.ctx.buffer(QUAD)
+
+        # Main video texture at the initial video size
         self.texture = self.ctx.texture((_init_w, _init_h), 3)
         self.texture.use(location=0)
         self.shader_idx = -1
         self.prog = None
         self._load_shader(_slot_shader_idx)
+
+        # OSD overlay program (full-screen coloured quad with alpha blending)
+        self._osd_prog = self.ctx.program(vertex_shader=VERT,
+                                          fragment_shader=_OSD_FRAG)
+        self._osd_vao  = self.ctx.vertex_array(self._osd_prog,
+                                               [(self._vbo, '2f', 'in_position')])
+        self._osd_timer = 0.0
+        self._osd_color = (1.0, 1.0, 1.0)
+
         global _shader_req, _new_fps
-        _shader_req = None   # already loaded above
-        _new_fps    = None   # already used for _init_fps
+        _shader_req = None
+        _new_fps    = None
+
         self.frame_interval  = 1.0 / _init_fps
         self.last_frame_time = 0.0
         self._fps_frames     = 0
         self._fps_accum      = 0.0
         self._audio_timer    = 0.0
+
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
+
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype='float32',
             blocksize=BLOCK_SIZE, device=AUDIO_DEVICE, callback=_audio_callback,
@@ -356,7 +399,7 @@ class VGLRApp(mglw.WindowConfig):
         print(f"shader: {name}")
 
     def on_render(self, time, frametime):
-        global _shader_req, _new_fps
+        global _shader_req, _new_fps, _osd_trigger
 
         if _shader_req is not None:
             self._load_shader(_shader_req)
@@ -365,6 +408,12 @@ class VGLRApp(mglw.WindowConfig):
         if _new_fps is not None:
             self.frame_interval = 1.0 / _new_fps
             _new_fps = None
+
+        # Start OSD timer when bank change is signalled
+        if _osd_trigger is not None:
+            self._osd_color = _osd_trigger
+            self._osd_timer = OSD_DURATION
+            _osd_trigger = None
 
         self._fps_frames += 1
         self._fps_accum  += frametime
@@ -411,6 +460,16 @@ class VGLRApp(mglw.WindowConfig):
                 pass
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
+        # OSD bank-change flash: alpha-blend a coloured overlay that fades out
+        if self._osd_timer > 0:
+            self._osd_timer -= frametime
+            alpha = max(0.0, self._osd_timer / OSD_DURATION) * 0.45
+            self._osd_prog['osd_color'] = (*self._osd_color, alpha)
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self._osd_vao.render(moderngl.TRIANGLE_STRIP)
+            self.ctx.disable(moderngl.BLEND)
+
     def key_event(self, key, action, modifiers):
         if action != self.wnd.keys.ACTION_PRESS:
             return
@@ -419,7 +478,6 @@ class VGLRApp(mglw.WindowConfig):
 
 
 # ── startup ───────────────────────────────────────────────────────────────────
-# Try bank1/video1; fall back to legacy FALLBACK_VIDEO if directory not set up yet
 _select_slot(1, 1)
 if _requested_video is None and os.path.exists(FALLBACK_VIDEO):
     _requested_video = FALLBACK_VIDEO
