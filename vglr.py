@@ -5,7 +5,7 @@ import moderngl
 import moderngl_window as mglw
 
 VERT = """
-#version 330 core
+#version 140
 in vec2 in_position;
 out vec2 uv;
 void main() {
@@ -15,7 +15,7 @@ void main() {
 """
 
 FRAG = """
-#version 330 core
+#version 140
 uniform float time;
 in vec2 uv;
 out vec4 fragColor;
@@ -37,7 +37,7 @@ QUAD = np.array([
 
 class VGLRApp(mglw.WindowConfig):
     title = "vglr"
-    gl_version = (3, 3)
+    gl_version = (3, 1)
     window_size = (1920, 1080)
     resizable = False
 
