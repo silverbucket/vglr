@@ -75,7 +75,7 @@ void main() {
 
     // audio modulation: bass drives wiggle, mid drives smear, beat spikes wiggle
     float wiggle = 3.0 * rf * (1.0 + bass * 3.0) + beat * 4.0 * rf;
-    float smear  = 0.5 * rf * (1.0 + mid  * 2.0);
+    float smear  = 0.5 * rf * (1.0 + mid * 2.0 + treble * 3.0);
 
     float framecount = time * 60.0;
     float d = 0.1 - ceil(mod(time/3.0, 1.0) + 0.5) * 0.1;
