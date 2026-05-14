@@ -15,6 +15,8 @@ with av.open(VIDEO_PATH) as _c:
     VIDEO_W, VIDEO_H = _s.width, _s.height
     VIDEO_FPS = float(_s.average_rate or _s.guessed_rate or 30)
 
+print(f"video: {VIDEO_W}x{VIDEO_H} @ {VIDEO_FPS:.3f} fps  (frame interval {1.0/VIDEO_FPS*1000:.1f}ms)")
+
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
 
@@ -69,9 +71,18 @@ class VGLRApp(mglw.WindowConfig):
         self.texture.use(location=0)
         self.frame_interval = 1.0 / VIDEO_FPS
         self.last_frame_time = 0.0
+        self._fps_frames = 0
+        self._fps_accum = 0.0
         threading.Thread(target=decode_loop, args=(VIDEO_PATH,), daemon=True).start()
 
     def on_render(self, time, frametime):
+        self._fps_frames += 1
+        self._fps_accum += frametime
+        if self._fps_accum >= 5.0:
+            print(f"render: {self._fps_frames / self._fps_accum:.1f} fps")
+            self._fps_frames = 0
+            self._fps_accum = 0.0
+
         self.ctx.clear()
         if time - self.last_frame_time >= self.frame_interval:
             try:
