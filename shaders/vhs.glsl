@@ -74,6 +74,11 @@ void main() {
     float d = 0.1 - ceil(mod(time/3.0, 1.0) + 0.5) * 0.1;
 
     vec2 p = jumpy(uv, framecount, wiggle, rf);
+
+    // Unconditional audio distortion — always visible, not gated by onOff
+    p.x += bass * 0.12 * sin(uv.y * 25.0 + time * 18.0);
+    p.y  = mod(p.y + beat * 0.06 * sin(uv.x * 15.0 + time * 9.0), 1.0);
+
     float s = 0.0001 * -d + 0.0001 * wiggle * sin(time);
     float e = min(0.30, pow(max(0.0, cos(p.y*4.0+0.3)-0.75)*(s+0.5), 3.0)) * 25.0 * rf;
     p.x += abs(s * pow(min(0.003, (-p.y + (0.01*mod(time, 17.0)))*3.0), 2.0)) * rf;
@@ -95,5 +100,7 @@ void main() {
     final.rgb = Blur(p, c, rf);
     float iq_q = rgb2yiq(final.rgb).b;
 
-    fragColor = vec4(yiq2rgb(vec3(y, iq_i, iq_q)) - pow(s + e*2.0, 3.0), 1.0);
+    vec3 col = yiq2rgb(vec3(y, iq_i, iq_q)) - pow(s + e*2.0, 3.0);
+    col += beat * 0.2;  // white flash on beat
+    fragColor = vec4(col, 1.0);
 }
