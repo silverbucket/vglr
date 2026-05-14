@@ -34,23 +34,16 @@ vec2 Circle(float Start, float Points, float Point) {
 
 vec3 Blur(vec2 p, float d, float rf) {
     vec2 Scale = 0.66 * 4.0 * 2.0 * vec2(d + 0.0005, 0.0) * rf;
-    float Start = 2.0 / 14.0;
-    float W = 1.0 / 15.0;
+    float Start = 2.0 / 7.0;
+    float W = 1.0 / 8.0;
     vec3 col =
-        texture(video, p + Circle(Start, 14.0,  0.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  1.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  2.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  3.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  4.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  5.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  6.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  7.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  8.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0,  9.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0, 10.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0, 11.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0, 12.0) * Scale).rgb +
-        texture(video, p + Circle(Start, 14.0, 13.0) * Scale).rgb +
+        texture(video, p + Circle(Start, 7.0, 0.0) * Scale).rgb +
+        texture(video, p + Circle(Start, 7.0, 1.0) * Scale).rgb +
+        texture(video, p + Circle(Start, 7.0, 2.0) * Scale).rgb +
+        texture(video, p + Circle(Start, 7.0, 3.0) * Scale).rgb +
+        texture(video, p + Circle(Start, 7.0, 4.0) * Scale).rgb +
+        texture(video, p + Circle(Start, 7.0, 5.0) * Scale).rgb +
+        texture(video, p + Circle(Start, 7.0, 6.0) * Scale).rgb +
         texture(video, p).rgb;
     return col * W;
 }

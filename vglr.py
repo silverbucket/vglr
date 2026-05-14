@@ -83,7 +83,7 @@ QUAD = np.array([
 class VGLRApp(mglw.WindowConfig):
     title = "vglr"
     gl_version = (3, 1)
-    window_size = (1920, 1080)
+    window_size = (1280, 720)
     resizable = False
 
     def __init__(self, **kwargs):
