@@ -9,7 +9,7 @@ import av
 import sounddevice as sd
 
 VIDEO_PATH = 'videos/fb_rev_wet_mop_reimagined.mp4'
-AUDIO_DEVICE = None  # None = system default; set to int index from: python -c "import sounddevice; print(sounddevice.query_devices())"
+AUDIO_DEVICE = 1  # Zoom F1: USB Audio (hw:2,0)
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
 GAIN = 50.0  # scale raw FFT magnitudes into 0-1; tune to your mic level
