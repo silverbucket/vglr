@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""vglr — multi-shader audio-reactive video player with MIDI Mix control."""
+"""vglr — audio-reactive video glitch player with MIDI Mix control."""
+import json
+import os
 import queue
+import time
 import threading
 import numpy as np
 import moderngl
@@ -15,98 +18,198 @@ except ImportError:
     MIDO_AVAILABLE = False
     print("mido not installed — running without MIDI (pip install mido python-rtmidi)")
 
-# ── video / audio config ─────────────────────────────────────────────────────
-VIDEO_PATH   = 'videos/fb_rev_wet_mop_reimagined.mp4'
-AUDIO_DEVICE = 1      # Zoom F1 (hw:2,0) — change if device order shifts
+# ── audio config ──────────────────────────────────────────────────────────────
+AUDIO_DEVICE = 1      # Zoom F1 (hw:2,0)
 SAMPLE_RATE  = 44100
 BLOCK_SIZE   = 1024
-GAIN         = 50.0   # FFT → 0-1 scale; tuned by fader 1-3 at runtime
+GAIN         = 50.0
 SMOOTH       = 0.3
 BEAT_DECAY   = 0.85
 
-# ── shaders ──────────────────────────────────────────────────────────────────
+FALLBACK_VIDEO = 'videos/fb_rev_wet_mop_reimagined.mp4'
+
+# ── shaders (name, path) ──────────────────────────────────────────────────────
 SHADERS = [
-    ('VHS',         'shaders/vhs.glsl',         {'param_a': 0.5, 'param_b': 0.4, 'param_c': 0.4}),
-    ('BlockGlitch', 'shaders/block_glitch.glsl', {'param_a': 0.4, 'param_b': 0.5, 'param_c': 0.4}),
-    ('Clean',       'shaders/passthrough.glsl',  {}),
+    ('vhs',         'shaders/vhs.glsl'),
+    ('block_glitch','shaders/block_glitch.glsl'),
+    ('clean',       'shaders/passthrough.glsl'),
 ]
 
 # ── AKAI MIDI Mix factory mapping ─────────────────────────────────────────────
-# Rec ARM notes (strips 1-8) — used for shader selection
-RECARM = [3, 6, 9, 12, 15, 18, 21, 24]
-# Mute notes (strips 1-8) — used for band on/off
-MUTE   = [1, 4, 7, 10, 13, 16, 19, 22]
-SOLO   = 27    # "clean hold" toggle
-BANK_L = 25
-BANK_R = 26
-
-# Channel fader CC numbers (strips 1-8) + master
-FADER_CC  = [19, 23, 27, 31, 49, 53, 57, 61]
+RECARM    = [3,  6,  9,  12, 15, 18, 21, 24]   # Rec ARM notes, strips 1-8
+MUTE      = [1,  4,  7,  10, 13, 16, 19, 22]   # Mute notes, strips 1-8
+SOLO      = 27
+BANK_L    = 25
+BANK_R    = 26
+FADER_CC  = [19, 23, 27, 31, 49, 53, 57, 61]   # fader CC, strips 1-8
+KNOB_CC   = [                                    # [SendA, SendB, SendC] per strip
+    [16, 17, 18], [20, 21, 22], [24, 25, 26], [28, 29, 30],
+    [46, 47, 48], [50, 51, 52], [54, 55, 56], [58, 59, 60],
+]
 MASTER_CC = 62
 
-# ── MIDI control state ────────────────────────────────────────────────────────
-# Simple floats/bools — CPython GIL makes writes atomic enough for these params
-_m_bass_gain   = 1.0   # fader 1  (0-2.0, centre=1.0)
-_m_mid_gain    = 1.0   # fader 2
-_m_treble_gain = 1.0   # fader 3
-_m_beat_thresh = 1.8   # fader 4  (1.0-4.5, higher = less sensitive)
-_m_master      = 1.0   # master fader (0-1.0)
-_m_effects_on  = True  # solo toggle — False suppresses all effects
-_m_bass_on     = True  # mute 1
-_m_mid_on      = True  # mute 2
-_m_treble_on   = True  # mute 3
-_m_shader_req  = None  # set by MIDI thread, consumed by render thread
-_midi_out       = None  # mido output port (set once MIDI connects)
+# ── per-slot defaults ─────────────────────────────────────────────────────────
+_DEFAULT_SETTINGS = {
+    'shader':      'vhs',
+    'intensity':   1.0,
+    'param_a':     0.5,
+    'param_b':     0.4,
+    'param_c':     0.4,
+    'beat_thresh': 1.8,
+}
+
+# ── live state (MIDI thread writes, render thread reads; GIL keeps atomicity) ─
+_current_bank     = 1
+_current_slot     = 1
+_slot_shader_idx  = 0
+_slot_intensity   = 1.0
+_slot_param_a     = 0.5
+_slot_param_b     = 0.4
+_slot_param_c     = 0.4
+_slot_beat_thresh = 1.8
+_m_master         = 1.0
+_shader_req       = None   # render thread picks this up each frame
+_midi_out         = None
+
+# ── video state ───────────────────────────────────────────────────────────────
+_requested_video = None   # decode thread polls; None = wait
+_new_fps         = None   # render thread updates frame_interval when set
+
+frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
 
+# ── slot filesystem ───────────────────────────────────────────────────────────
+def _slot_dir(bank: int, slot: int) -> str:
+    return os.path.join('videos', f'bank{bank}', f'video{slot}')
+
+
+def _find_video(bank: int, slot: int) -> str | None:
+    d = _slot_dir(bank, slot)
+    if not os.path.isdir(d):
+        return None
+    for f in sorted(os.listdir(d)):
+        if f.lower().endswith(('.mp4', '.mkv', '.mov')):
+            return os.path.join(d, f)
+    return None
+
+
+def _settings_path(bank: int, slot: int) -> str:
+    return os.path.join(_slot_dir(bank, slot), 'settings.json')
+
+
+def _load_settings(bank: int, slot: int) -> dict:
+    try:
+        with open(_settings_path(bank, slot)) as f:
+            return {**_DEFAULT_SETTINGS, **json.load(f)}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return _DEFAULT_SETTINGS.copy()
+
+
+def _save_settings(bank: int, slot: int) -> None:
+    cfg = {
+        'shader':      SHADERS[_slot_shader_idx][0],
+        'intensity':   _slot_intensity,
+        'param_a':     _slot_param_a,
+        'param_b':     _slot_param_b,
+        'param_c':     _slot_param_c,
+        'beat_thresh': _slot_beat_thresh,
+    }
+    os.makedirs(_slot_dir(bank, slot), exist_ok=True)
+    with open(_settings_path(bank, slot), 'w') as f:
+        json.dump(cfg, f, indent=2)
+    print(f"saved: {_settings_path(bank, slot)}")
+
+
+def _apply_settings(cfg: dict) -> None:
+    global _slot_shader_idx, _slot_intensity, _slot_param_a
+    global _slot_param_b, _slot_param_c, _slot_beat_thresh, _shader_req
+    idx = next((i for i, (n, _) in enumerate(SHADERS) if n == cfg['shader']), 0)
+    _slot_shader_idx  = idx
+    _slot_intensity   = cfg['intensity']
+    _slot_param_a     = cfg['param_a']
+    _slot_param_b     = cfg['param_b']
+    _slot_param_c     = cfg['param_c']
+    _slot_beat_thresh = cfg['beat_thresh']
+    _shader_req = idx
+
+
+def _select_slot(bank: int, slot: int) -> None:
+    global _current_bank, _current_slot, _requested_video
+    _current_bank = bank
+    _current_slot = slot
+    _apply_settings(_load_settings(bank, slot))
+    video = _find_video(bank, slot)
+    if video:
+        _requested_video = video
+        print(f"slot: bank{bank}/video{slot}  {os.path.basename(video)}")
+    else:
+        print(f"slot: bank{bank}/video{slot}  (no video)")
+    print(f"  shader={SHADERS[_slot_shader_idx][0]}  intensity={_slot_intensity:.2f}")
+    if _midi_out:
+        _slot_leds(slot)
+        _effect_leds(_slot_shader_idx)
+
+
+# ── LED helpers ───────────────────────────────────────────────────────────────
 def _set_led(note: int, on: bool) -> None:
     if _midi_out:
         _midi_out.send(mido.Message('note_on', channel=0, note=note,
-                                     velocity=127 if on else 0))
+                                    velocity=127 if on else 0))
 
 
-def _shader_leds(active_idx: int) -> None:
-    for i, note in enumerate(RECARM[:len(SHADERS)]):
+def _slot_leds(active: int) -> None:
+    """Light the Rec ARM LED for the active slot (1-indexed), clear the rest."""
+    for i, note in enumerate(RECARM):
+        _set_led(note, (i + 1) == active)
+
+
+def _effect_leds(active_idx: int) -> None:
+    """Light the Mute LED for the active shader index, clear the rest."""
+    for i, note in enumerate(MUTE[:len(SHADERS)]):
         _set_led(note, i == active_idx)
 
 
+# ── MIDI ──────────────────────────────────────────────────────────────────────
 def _handle_midi(msg) -> None:
-    global _m_bass_gain, _m_mid_gain, _m_treble_gain, _m_beat_thresh
-    global _m_master, _m_effects_on, _m_bass_on, _m_mid_on, _m_treble_on
-    global _m_shader_req
+    global _m_master, _slot_intensity, _slot_param_a, _slot_param_b, _slot_param_c
+    global _slot_shader_idx, _shader_req
 
     if msg.type in ('note_on', 'note_off'):
         if msg.type == 'note_off' or msg.velocity == 0:
             return
         note = msg.note
-        # Rec ARM 1-N → select shader
-        for i, n in enumerate(RECARM[:len(SHADERS)]):
+        # Rec ARM 1-8 → select video slot
+        for i, n in enumerate(RECARM):
             if note == n:
-                _m_shader_req = i
-                _shader_leds(i)
+                _select_slot(_current_bank, i + 1)
                 return
-        # Mute 1-3 → toggle band reactivity
-        if note == MUTE[0]:
-            _m_bass_on = not _m_bass_on
-            _set_led(MUTE[0], _m_bass_on)
-        elif note == MUTE[1]:
-            _m_mid_on = not _m_mid_on
-            _set_led(MUTE[1], _m_mid_on)
-        elif note == MUTE[2]:
-            _m_treble_on = not _m_treble_on
-            _set_led(MUTE[2], _m_treble_on)
-        # Solo → suppress all effects while toggled on
+        # Mute 1-N → select shader/effect
+        for i, n in enumerate(MUTE[:len(SHADERS)]):
+            if note == n:
+                _slot_shader_idx = i
+                _shader_req = i
+                _effect_leds(i)
+                return
+        if note == BANK_L:
+            _select_slot(max(1, _current_bank - 1), _current_slot)
+        elif note == BANK_R:
+            _select_slot(_current_bank + 1, _current_slot)
         elif note == SOLO:
-            _m_effects_on = not _m_effects_on
-            _set_led(SOLO, not _m_effects_on)   # LED on = effects suppressed
+            _save_settings(_current_bank, _current_slot)
 
     elif msg.type == 'control_change':
         cc, v = msg.control, msg.value
-        if   cc == FADER_CC[0]: _m_bass_gain   = v / 64.0            # 0→2.0
-        elif cc == FADER_CC[1]: _m_mid_gain    = v / 64.0
-        elif cc == FADER_CC[2]: _m_treble_gain = v / 64.0
-        elif cc == FADER_CC[3]: _m_beat_thresh = 1.0 + v / 127.0 * 3.5  # 1.0→4.5
-        elif cc == MASTER_CC:   _m_master      = v / 127.0
+        si = _current_slot - 1  # 0-indexed strip
+        if cc == FADER_CC[si]:
+            _slot_intensity = v / 127.0
+        elif cc == KNOB_CC[si][0]:
+            _slot_param_a = v / 127.0
+        elif cc == KNOB_CC[si][1]:
+            _slot_param_b = v / 127.0
+        elif cc == KNOB_CC[si][2]:
+            _slot_param_c = v / 127.0
+        elif cc == MASTER_CC:
+            _m_master = v / 127.0
 
 
 def _midi_loop() -> None:
@@ -122,10 +225,8 @@ def _midi_loop() -> None:
         print(f"MIDI: in={in_name}  out={out_name}")
         with mido.open_output(out_name) as outport:
             _midi_out = outport
-            _shader_leds(0)
-            for note in [MUTE[0], MUTE[1], MUTE[2]]:
-                _set_led(note, True)
-            _set_led(SOLO, False)
+            _slot_leds(_current_slot)
+            _effect_leds(_slot_shader_idx)
             with mido.open_input(in_name) as inport:
                 for msg in inport:
                     _handle_midi(msg)
@@ -133,25 +234,36 @@ def _midi_loop() -> None:
         print(f"MIDI error: {exc}")
 
 
-# ── video decode ─────────────────────────────────────────────────────────────
-with av.open(VIDEO_PATH) as _c:
-    _s = _c.streams.video[0]
-    VIDEO_W, VIDEO_H = _s.width, _s.height
-    VIDEO_FPS = float(_s.average_rate or _s.guessed_rate or 30)
-
-print(f"video: {VIDEO_W}x{VIDEO_H} @ {VIDEO_FPS:.3f} fps")
-
-frame_queue: queue.Queue = queue.Queue(maxsize=4)
-
-
-def _decode_loop(path: str) -> None:
+# ── video decode ──────────────────────────────────────────────────────────────
+def _decode_loop() -> None:
+    global _new_fps
+    current = None
     while True:
-        with av.open(path) as container:
+        target = _requested_video
+        if not target:
+            time.sleep(0.05)
+            continue
+        if target != current:
+            while not frame_queue.empty():
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+            current = target
+        with av.open(current) as container:
+            s = container.streams.video[0]
+            _new_fps = float(s.average_rate or s.guessed_rate or 30)
             for frame in container.decode(video=0):
-                frame_queue.put(frame.to_ndarray(format='rgb24'), block=True)
+                if _requested_video != current:
+                    break
+                try:
+                    frame_queue.put(frame.to_ndarray(format='rgb24'),
+                                    block=True, timeout=0.5)
+                except queue.Full:
+                    pass
 
 
-# ── audio capture ─────────────────────────────────────────────────────────────
+# ── audio ─────────────────────────────────────────────────────────────────────
 _FREQS       = np.fft.rfftfreq(BLOCK_SIZE, d=1.0 / SAMPLE_RATE)
 _BASS_MASK   = (_FREQS >= 20)  & (_FREQS < 250)
 _MID_MASK    = (_FREQS >= 250) & (_FREQS < 4000)
@@ -170,7 +282,7 @@ def _audio_callback(indata, frames, time_info, status):
     mid    = min(float(np.mean(fft[_MID_MASK]))    * GAIN, 1.0)
     treble = min(float(np.mean(fft[_TREBLE_MASK])) * GAIN, 1.0)
     energy = float(np.sum(fft ** 2))
-    beat   = 1.0 if (_energy_smooth > 0 and energy > _energy_smooth * _m_beat_thresh) else 0.0
+    beat   = 1.0 if (_energy_smooth > 0 and energy > _energy_smooth * _slot_beat_thresh) else 0.0
     _energy_smooth = _energy_smooth * 0.9 + energy * 0.1
     with _lock:
         _bands['bass']   += SMOOTH * (bass   - _bands['bass'])
@@ -179,7 +291,7 @@ def _audio_callback(indata, frames, time_info, status):
         _bands['beat']    = max(_bands['beat'] * BEAT_DECAY, beat)
 
 
-# ── GL helpers ────────────────────────────────────────────────────────────────
+# ── GL ────────────────────────────────────────────────────────────────────────
 VERT = """
 #version 140
 in vec2 in_position;
@@ -200,7 +312,6 @@ def _set_uniform(prog, name, value):
         pass
 
 
-# ── app ───────────────────────────────────────────────────────────────────────
 class VGLRApp(mglw.WindowConfig):
     title = "vglr"
     gl_version = (3, 1)
@@ -209,21 +320,22 @@ class VGLRApp(mglw.WindowConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._vbo      = self.ctx.buffer(QUAD)
-        self.texture   = self.ctx.texture((VIDEO_W, VIDEO_H), 3)
+        self._vbo = self.ctx.buffer(QUAD)
+        self.texture = self.ctx.texture((_init_w, _init_h), 3)
+        self.texture.use(location=0)
         self.shader_idx = -1
-        self.prog       = None
-        self._load_shader(0)
-
-        self.frame_interval  = 1.0 / VIDEO_FPS
+        self.prog = None
+        self._load_shader(_slot_shader_idx)
+        global _shader_req, _new_fps
+        _shader_req = None   # already loaded above
+        _new_fps    = None   # already used for _init_fps
+        self.frame_interval  = 1.0 / _init_fps
         self.last_frame_time = 0.0
         self._fps_frames     = 0
         self._fps_accum      = 0.0
         self._audio_timer    = 0.0
-
-        threading.Thread(target=_decode_loop, args=(VIDEO_PATH,), daemon=True).start()
+        threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
-
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype='float32',
             blocksize=BLOCK_SIZE, device=AUDIO_DEVICE, callback=_audio_callback,
@@ -231,7 +343,7 @@ class VGLRApp(mglw.WindowConfig):
         self._stream.start()
 
     def _load_shader(self, idx: int) -> None:
-        name, path, defaults = SHADERS[idx]
+        name, path = SHADERS[idx]
         with open(path) as f:
             frag = f.read()
         if self.prog:
@@ -240,20 +352,20 @@ class VGLRApp(mglw.WindowConfig):
         self.vao  = self.ctx.vertex_array(self.prog, [(self._vbo, '2f', 'in_position')])
         _set_uniform(self.prog, 'video', 0)
         self.texture.use(location=0)
-        for k, v in defaults.items():
-            _set_uniform(self.prog, k, v)
         self.shader_idx = idx
-        print(f"shader: {name} ({path})")
+        print(f"shader: {name}")
 
     def on_render(self, time, frametime):
-        global _m_shader_req
+        global _shader_req, _new_fps
 
-        # ── shader switch requested by MIDI ──
-        if _m_shader_req is not None:
-            self._load_shader(_m_shader_req)
-            _m_shader_req = None
+        if _shader_req is not None:
+            self._load_shader(_shader_req)
+            _shader_req = None
 
-        # ── fps logging ──
+        if _new_fps is not None:
+            self.frame_interval = 1.0 / _new_fps
+            _new_fps = None
+
         self._fps_frames += 1
         self._fps_accum  += frametime
         self._audio_timer += frametime
@@ -263,32 +375,32 @@ class VGLRApp(mglw.WindowConfig):
             self._fps_frames = 0
             self._fps_accum  = 0.0
 
-        # ── audio values with MIDI gain applied ──
         with _lock:
             br, mr, tr, bt = (_bands['bass'], _bands['mid'],
                                _bands['treble'], _bands['beat'])
 
-        if _m_effects_on:
-            bass   = br * (_m_bass_gain   * _m_master) if _m_bass_on   else 0.0
-            mid    = mr * (_m_mid_gain    * _m_master) if _m_mid_on    else 0.0
-            treble = tr * (_m_treble_gain * _m_master) if _m_treble_on else 0.0
-            beat   = bt * _m_master
-        else:
-            bass = mid = treble = beat = 0.0
+        intensity = _slot_intensity * _m_master
+        bass   = br * intensity
+        mid    = mr * intensity
+        treble = tr * intensity
+        beat   = bt * intensity
 
         if self._audio_timer >= 1.0:
-            print(f"bass={bass:.3f}  mid={mid:.3f}  treble={treble:.3f}  beat={beat:.3f}")
+            print(f"bass={bass:.3f}  mid={mid:.3f}  treble={treble:.3f}  "
+                  f"beat={beat:.3f}  intensity={intensity:.2f}")
             self._audio_timer = 0.0
 
-        # ── set uniforms ──
         _set_uniform(self.prog, 'resolution', self.wnd.size)
         _set_uniform(self.prog, 'time',       time)
         _set_uniform(self.prog, 'bass',       float(bass))
         _set_uniform(self.prog, 'mid',        float(mid))
         _set_uniform(self.prog, 'treble',     float(treble))
         _set_uniform(self.prog, 'beat',       float(beat))
+        _set_uniform(self.prog, 'intensity',  float(intensity))
+        _set_uniform(self.prog, 'param_a',    float(_slot_param_a))
+        _set_uniform(self.prog, 'param_b',    float(_slot_param_b))
+        _set_uniform(self.prog, 'param_c',    float(_slot_param_c))
 
-        # ── video frame ──
         self.ctx.clear()
         if time - self.last_frame_time >= self.frame_interval:
             try:
@@ -305,6 +417,24 @@ class VGLRApp(mglw.WindowConfig):
         if key == self.wnd.keys.Q:
             self.wnd.close()
 
+
+# ── startup ───────────────────────────────────────────────────────────────────
+# Try bank1/video1; fall back to legacy FALLBACK_VIDEO if directory not set up yet
+_select_slot(1, 1)
+if _requested_video is None and os.path.exists(FALLBACK_VIDEO):
+    _requested_video = FALLBACK_VIDEO
+    print(f"fallback: {FALLBACK_VIDEO}")
+
+if _requested_video:
+    with av.open(_requested_video) as _c:
+        _s = _c.streams.video[0]
+        _init_w   = _s.width
+        _init_h   = _s.height
+        _init_fps = float(_s.average_rate or _s.guessed_rate or 30)
+    print(f"video: {_init_w}x{_init_h} @ {_init_fps:.3f} fps")
+else:
+    _init_w, _init_h, _init_fps = 1920, 1080, 30.0
+    print("WARNING: no video found — add videos/bank1/video1/*.mp4")
 
 if __name__ == '__main__':
     mglw.run_window_config(VGLRApp)

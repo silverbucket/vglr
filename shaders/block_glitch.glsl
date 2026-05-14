@@ -7,9 +7,10 @@ uniform float bass;
 uniform float mid;
 uniform float treble;
 uniform float beat;
-uniform float param_a;  // block coarseness: 0=fine bands, 1=thick bands
-uniform float param_b;  // chromatic aberration strength
-uniform float param_c;  // glitch density: 0=sparse, 1=every band
+uniform float intensity;  // fader: 0=clean passthrough, 1=full effect
+uniform float param_a;    // block coarseness: 0=fine bands, 1=thick bands
+uniform float param_b;    // chromatic aberration strength
+uniform float param_c;    // glitch density: 0=sparse, 1=every band
 
 in vec2 uv;
 out vec4 fragColor;
@@ -65,8 +66,6 @@ void main() {
     float scanEdge = step(0.91, fract(uv.y / blockH));
     col *= 1.0 - scanEdge * 0.55 * param_a;
 
-    // Beat white flash
     col += beat * 0.2;
-
-    fragColor = vec4(col, 1.0);
+    fragColor = mix(texture(video, uv), vec4(col, 1.0), intensity);
 }

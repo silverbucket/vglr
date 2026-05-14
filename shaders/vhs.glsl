@@ -7,6 +7,10 @@ uniform float bass;
 uniform float mid;
 uniform float treble;
 uniform float beat;
+uniform float intensity;  // fader: 0=clean passthrough, 1=full effect
+uniform float param_a;
+uniform float param_b;
+uniform float param_c;
 
 in vec2 uv;
 out vec4 fragColor;
@@ -101,6 +105,6 @@ void main() {
     float iq_q = rgb2yiq(final.rgb).b;
 
     vec3 col = yiq2rgb(vec3(y, iq_i, iq_q)) - pow(s + e*2.0, 3.0);
-    col += beat * 0.2;  // white flash on beat
-    fragColor = vec4(col, 1.0);
+    col += beat * 0.2;
+    fragColor = mix(texture(video, uv), vec4(col, 1.0), intensity);
 }
