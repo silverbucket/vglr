@@ -22,7 +22,7 @@ except ImportError:
 AUDIO_DEVICE = 1      # Zoom F1 (hw:2,0)
 SAMPLE_RATE  = 44100
 BLOCK_SIZE   = 1024
-GAIN         = 50.0
+GAIN         = 200.0  # higher = more sensitive; tune per venue
 SMOOTH       = 0.3
 BEAT_DECAY   = 0.85
 
@@ -375,6 +375,7 @@ class VGLRApp(mglw.WindowConfig):
         self._fps_frames     = 0
         self._fps_accum      = 0.0
         self._audio_timer    = 0.0
+        self._smooth_energy  = 0.0   # render-rate smoothing for intensity envelope
 
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
@@ -428,15 +429,26 @@ class VGLRApp(mglw.WindowConfig):
             br, mr, tr, bt = (_bands['bass'], _bands['mid'],
                                _bands['treble'], _bands['beat'])
 
-        intensity = _slot_intensity * _m_master
-        bass   = br * intensity
-        mid    = mr * intensity
-        treble = tr * intensity
-        beat   = bt * intensity
+        # Fader = max effect ceiling at full volume.
+        # Audio energy drives the wet/dry intensity: quiet → clean, loud → effect.
+        ceiling     = _slot_intensity * _m_master
+        raw_energy  = min(br * 2.5 + mr * 0.8 + tr * 0.4, 1.0)
+        # Snappy attack, slow release — intensity lingers after a loud hit
+        rate = 0.4 if raw_energy > self._smooth_energy else 0.08
+        self._smooth_energy += rate * (raw_energy - self._smooth_energy)
+        intensity = self._smooth_energy * ceiling
+
+        # Raw audio values go to the shader for parameter modulation (full 0-1 range).
+        # Not scaled by ceiling so the internal effect character is always responsive.
+        bass   = float(br)
+        mid    = float(mr)
+        treble = float(tr)
+        beat   = float(bt)
 
         if self._audio_timer >= 1.0:
             print(f"bass={bass:.3f}  mid={mid:.3f}  treble={treble:.3f}  "
-                  f"beat={beat:.3f}  intensity={intensity:.2f}")
+                  f"beat={beat:.3f}  lvl={raw_energy:.2f}  "
+                  f"ceil={ceiling:.2f}  fx={intensity:.3f}")
             self._audio_timer = 0.0
 
         _set_uniform(self.prog, 'resolution', self.wnd.size)
