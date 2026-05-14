@@ -47,7 +47,7 @@ class VGLRApp(mglw.WindowConfig):
         vbo = self.ctx.buffer(QUAD)
         self.vao = self.ctx.vertex_array(self.prog, [(vbo, '2f', 'in_position')])
 
-    def render(self, time, frametime):
+    def on_render(self, time, frametime):
         self.ctx.clear()
         self.prog['time'].value = time
         self.vao.render(moderngl.TRIANGLE_STRIP)
