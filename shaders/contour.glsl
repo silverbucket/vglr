@@ -46,5 +46,5 @@ void main() {
     vec3 fill = mix(vec3(0.04), video_col * 0.55, param_c);
     vec3 col  = mix(fill, line_col, line);
 
-    fragColor = mix(video_col, vec4(col, 1.0), intensity);
+    fragColor = mix(texture(video, uv), vec4(col, 1.0), intensity);
 }
