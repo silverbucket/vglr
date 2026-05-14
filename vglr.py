@@ -1,47 +1,61 @@
-import mpv
-import sounddevice as sd
+#!/usr/bin/env python3
+"""vglr — step 5a: moderngl-window + static test pattern."""
 import numpy as np
-import time
-import json
-import threading
+import moderngl
+import moderngl_window as mglw
 
-# Load playlist
-with open('playlist.json') as f:
-    playlist = json.load(f)
+VERT = """
+#version 330 core
+in vec2 in_position;
+out vec2 uv;
+void main() {
+    uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
 
-player = mpv.MPV(vo='gpu-next', gpu_api='auto', fullscreen=True, loop=True)
+FRAG = """
+#version 330 core
+uniform float time;
+in vec2 uv;
+out vec4 fragColor;
+void main() {
+    float r = 0.5 + 0.5 * sin(time + uv.x * 6.28318);
+    float g = 0.5 + 0.5 * sin(time * 1.3 + uv.y * 6.28318);
+    float b = 0.5 + 0.5 * sin(time * 0.7 + (uv.x + uv.y) * 3.14159);
+    fragColor = vec4(r, g, b, 1.0);
+}
+"""
 
-current_index = 0
-current_shader = None
+QUAD = np.array([
+    -1.0,  1.0,
+    -1.0, -1.0,
+     1.0,  1.0,
+     1.0, -1.0,
+], dtype='f4')
 
-def load_video(item):
-    global current_shader
-    player.play(item['video'])
-    if current_shader:
-        player.command('change-list', 'glsl-shaders', 'remove', current_shader)
-    if 'shader' in item and item['shader']:
-        shader_path = f"shaders/{item['shader']}.glsl"
-        player.command('change-list', 'glsl-shaders', 'append', shader_path)
-        current_shader = shader_path
 
-# Simple audio reactivity thread
-def audio_reactivity():
-    device = None  # set to your Zoom F1 device index/name
-    with sd.InputStream(samplerate=44100, channels=1, dtype='float32', device=device) as stream:
-        while True:
-            data, _ = stream.read(2048)
-            volume = np.abs(data).mean()
-            # Map volume to shader parameter (example)
-            if current_shader:
-                intensity = min(1.0, volume * 8)  # tune this multiplier
-                player.command('set', 'glsl-shader-opts', f'intensity={intensity}')
-            time.sleep(0.03)
+class VGLRApp(mglw.WindowConfig):
+    title = "vglr"
+    gl_version = (3, 3)
+    window_size = (1920, 1080)
+    resizable = False
 
-# Start audio thread
-threading.Thread(target=audio_reactivity, daemon=True).start()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.prog = self.ctx.program(vertex_shader=VERT, fragment_shader=FRAG)
+        vbo = self.ctx.buffer(QUAD)
+        self.vao = self.ctx.vertex_array(self.prog, [(vbo, '2f', 'in_position')])
 
-# Load first video
-load_video(playlist[0])
+    def render(self, time, frametime):
+        self.ctx.clear()
+        self.prog['time'].value = time
+        self.vao.render(moderngl.TRIANGLE_STRIP)
 
-print("Press Ctrl+C to quit. Test your Zoom F1 now!")
-mpv.MPV.wait_for_property(player, 'idle-active', lambda p: False)  # keep running
+    def key_event(self, key, action, modifiers):
+        if action == self.wnd.keys.ACTION_PRESS and key == self.wnd.keys.Q:
+            self.wnd.close()
+
+
+if __name__ == '__main__':
+    mglw.run_window_config(VGLRApp)
