@@ -3,6 +3,7 @@
 import json
 import os
 import queue
+import random
 import time
 import threading
 import numpy as np
@@ -510,8 +511,10 @@ class VGLRApp(mglw.WindowConfig):
         self._fps_frames     = 0
         self._fps_accum      = 0.0
         self._audio_timer    = 0.0
-        self._smooth_energy  = 0.0
-        self._flip_active    = False   # True while beat-triggered flip is on
+        self._smooth_energy   = 0.0
+        self._flip_active     = False  # True while beat-triggered flip is on
+        self._flip_timer      = 0.0   # counts down; flip holds until this hits 0
+        self._prev_beat_high  = False  # rising-edge detection for beat onset
 
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
@@ -589,10 +592,14 @@ class VGLRApp(mglw.WindowConfig):
             except queue.Empty:
                 pass
 
-        # Beat-triggered screen flip: uses raw bt (pre-master) so it fires regardless
-        # of master level. bt decays at BEAT_DECAY (~23ms per audio block), so the
-        # flip holds for ~250ms per kick drum before fading back.
-        self._flip_active = float(bt) > 0.15
+        # Beat-triggered screen flip: ~5% chance per beat onset, holds 0.4s.
+        # Uses raw pre-master bt for detection so master level doesn't suppress it.
+        beat_high = float(bt) > 0.8
+        if beat_high and not self._prev_beat_high and random.random() < 0.05:
+            self._flip_timer = 0.4
+        self._prev_beat_high = beat_high
+        self._flip_timer  = max(0.0, self._flip_timer - frametime)
+        self._flip_active = self._flip_timer > 0.0
 
         # For single-effect or final-screen render: choose normal or flip progs.
         screen_progs = self._progs_flip if self._flip_active else self._progs
