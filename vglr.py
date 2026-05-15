@@ -409,6 +409,21 @@ void main() {
 }
 """
 
+# Same UV as VERT but gl_Position.y is negated.
+# Two uses:
+#   1. Pass 1 of dual-effect chain: stores the FBO content with the same y=0-at-top
+#      orientation as the video texture, so Pass 2 can sample it with the normal UV.
+#   2. Beat-triggered screen flip: outputs the final image upside-down.
+VERT_FLIP = """
+#version 140
+in vec2 in_position;
+out vec2 uv;
+void main() {
+    uv = vec2(in_position.x * 0.5 + 0.5, 1.0 - (in_position.y * 0.5 + 0.5));
+    gl_Position = vec4(in_position.x, -in_position.y, 0.0, 1.0);
+}
+"""
+
 _OSD_FRAG = """
 #version 140
 uniform vec4 osd_color;
@@ -448,8 +463,11 @@ class VGLRApp(mglw.WindowConfig):
         self.texture = self.ctx.texture((_init_w, _init_h), 3)
         self.texture.use(location=0)
 
-        # Pre-compile all effect shaders at startup — no latency when toggling
-        self._progs = {}   # shader_idx -> (prog, vao)
+        # Pre-compile all effect shaders at startup — no latency when toggling.
+        # Each shader is compiled twice: once with VERT (normal screen output)
+        # and once with VERT_FLIP (position-flipped, for FBO writes and beat flip).
+        self._progs      = {}   # shader_idx -> (prog, vao)  — normal output
+        self._progs_flip = {}   # shader_idx -> (prog, vao)  — position-flipped output
         for i, (name, path) in enumerate(SHADERS):
             try:
                 with open(path) as f:
@@ -458,6 +476,11 @@ class VGLRApp(mglw.WindowConfig):
                 vao  = self.ctx.vertex_array(prog, [(self._vbo, '2f', 'in_position')])
                 _set_uniform(prog, 'video', 0)
                 self._progs[i] = (prog, vao)
+
+                prog_f = self.ctx.program(vertex_shader=VERT_FLIP, fragment_shader=frag)
+                vao_f  = self.ctx.vertex_array(prog_f, [(self._vbo, '2f', 'in_position')])
+                _set_uniform(prog_f, 'video', 0)
+                self._progs_flip[i] = (prog_f, vao_f)
                 print(f"compiled: {name}")
             except Exception as exc:
                 print(f"shader error ({name}): {exc}")
@@ -488,6 +511,7 @@ class VGLRApp(mglw.WindowConfig):
         self._fps_accum      = 0.0
         self._audio_timer    = 0.0
         self._smooth_energy  = 0.0
+        self._flip_active    = False   # True while beat-triggered flip is on
 
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
@@ -565,6 +589,14 @@ class VGLRApp(mglw.WindowConfig):
             except queue.Empty:
                 pass
 
+        # Beat-triggered screen flip: uses raw bt (pre-master) so it fires regardless
+        # of master level. bt decays at BEAT_DECAY (~23ms per audio block), so the
+        # flip holds for ~250ms per kick drum before fading back.
+        self._flip_active = float(bt) > 0.15
+
+        # For single-effect or final-screen render: choose normal or flip progs.
+        screen_progs = self._progs_flip if self._flip_active else self._progs
+
         effects = list(_active_effects)   # stable snapshot for this frame
 
         if not effects:
@@ -576,8 +608,8 @@ class VGLRApp(mglw.WindowConfig):
 
         elif len(effects) == 1:
             idx = effects[0]
-            if idx in self._progs:
-                prog, vao = self._progs[idx]
+            if idx in screen_progs:
+                prog, vao = screen_progs[idx]
                 params = _effect_params[idx]
                 self._set_effect_uniforms(
                     prog, time, params['intensity'] * energy_scaled,
@@ -588,15 +620,17 @@ class VGLRApp(mglw.WindowConfig):
                 vao.render(moderngl.TRIANGLE_STRIP)
 
         else:
-            # Two effects: A → FBO, then B reads FBO as its "video" input
+            # Two effects: A → FBO, then B reads FBO as its "video" input.
+            # Pass 1 always uses _progs_flip so the FBO stores content with the same
+            # y=0-at-top orientation as the video texture (double-flip cancels in Pass 2).
             idx_a, idx_b = effects[0], effects[1]
-            if idx_a in self._progs and idx_b in self._progs:
-                prog_a, vao_a = self._progs[idx_a]
-                prog_b, vao_b = self._progs[idx_b]
+            if idx_a in self._progs_flip and idx_b in screen_progs:
+                prog_a, vao_a = self._progs_flip[idx_a]
+                prog_b, vao_b = screen_progs[idx_b]
                 params_a = _effect_params[idx_a]
                 params_b = _effect_params[idx_b]
 
-                # Pass 1: render effect A into FBO
+                # Pass 1: render effect A into FBO (position-flipped to fix orientation)
                 self._fbo.use()
                 self._fbo.clear()
                 self._set_effect_uniforms(
