@@ -45,7 +45,7 @@ sensitivity fine-tune, not a venue calibration.
 
 ---
 
-## Model B — "ceiling-normalizer"  *(introduced: see `git log -1 -- docs/intensity-models.md`)*
+## Model B — "ceiling-normalizer"  *(introduced: d05cb0e)*
 
 ### Behaviour
 
@@ -97,10 +97,11 @@ show is.
 ## Switching
 
 ```bash
-# Restore Model A
+# Restore Model A (floor-sensitivity)
 git checkout c847b5c -- vglr.py
 
-# Restore Model B (find the transition commit)
-git log --oneline -- vglr.py | head -5
-git checkout <model-b-hash> -- vglr.py
+# Restore Model B (ceiling-normalizer)
+git checkout d05cb0e -- vglr.py
 ```
+
+After switching, restart vglr.
