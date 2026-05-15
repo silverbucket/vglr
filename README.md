@@ -92,8 +92,12 @@ The fader and knobs on strip N always control whichever effect is currently sele
 
 ## Effects
 
-| # | Name | Description | param_a | param_b | param_c |
-|---|------|-------------|---------|---------|---------|
+Press **SOLO** to toggle between effect pages. Purple OSD flash confirms page change.
+
+### Page 1 (default)
+
+| MUTE | Name | Description | param_a | param_b | param_c |
+|------|------|-------------|---------|---------|---------|
 | 1 | vhs | VHS scan jitter, colour smear, Y/C noise | wiggle amount | smear strength | noise density |
 | 2 | block_glitch | Rectangular block displacement | block size | shift amount | colour split |
 | 3 | kaleidoscope | Radial mirror tiles that sway with bass | segment count | sway amount | zoom |
@@ -103,7 +107,20 @@ The fader and knobs on strip N always control whichever effect is currently sele
 | 7 | contour | Edge/contour detection overlay | edge threshold | line weight | colour blend |
 | 8 | melt | Vertical melt/drip | drip speed | drip width | colour shift |
 
-To add effects to page 2, append entries to the `SHADERS` list in `vglr.py` and place the `.glsl` file in `shaders/`.
+### Page 2 (press SOLO once)
+
+| MUTE | Name | Description | param_a | param_b | param_c |
+|------|------|-------------|---------|---------|---------|
+| 1 | thermal | Heat-vision palette map; fire or ice mode | palette (fire↔ice) | bloom spread | heat threshold |
+| 2 | neon_glow | Neon edge glow on dark background; hue cycles with bass | edge threshold | glow spread | video bleed |
+| 3 | lens_warp | Barrel distortion + chromatic aberration; stereo width drives asymmetric pull | distortion strength | aberration split | vignette |
+| 4 | slit_scan | Scanline time-delay smear with rainbow colour separation | scan frequency | scan depth | colour spread |
+| 5 | posterize | Colour quantization + hue rotation; beat snaps to 2-level pop-art | colour levels | hue rotation speed | saturation boost |
+| 6 | voronoi_shatter | Cracked-glass cell tessellation; cells drift with audio, neon edges | cell scale | cell displacement | edge glow width |
+| 7 | film_burn | Cinematic halation, light leaks on beat, orange-teal grade, grain | halation strength | grade warmth | grain intensity |
+| 8 | mirror_tile | Tiled mirror from a Lissajous-roaming crop window; per-tile colour tint | crop window size | tile count | tint intensity |
+
+To add a page 3, append 8 more entries to the `SHADERS` list in `vglr.py`.
 
 ### Shader uniforms
 

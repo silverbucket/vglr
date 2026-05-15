@@ -30,14 +30,24 @@ FALLBACK_VIDEO = 'videos/fb_rev_wet_mop_reimagined.mp4'
 
 # ── shaders (name, path) — 8 slots map to 8 Mute buttons ─────────────────────
 SHADERS = [
-    ('vhs',         'shaders/vhs.glsl'),
-    ('block_glitch','shaders/block_glitch.glsl'),
-    ('kaleidoscope','shaders/kaleidoscope.glsl'),
-    ('vortex',      'shaders/vortex.glsl'),
-    ('rgb_orbit',   'shaders/rgb_orbit.glsl'),
-    ('pixel_sort',  'shaders/pixel_sort.glsl'),
-    ('contour',     'shaders/contour.glsl'),
-    ('melt',        'shaders/melt.glsl'),
+    # ── page 1 (SOLO × 0) ─────────────────────────────────────────────────────
+    ('vhs',            'shaders/vhs.glsl'),
+    ('block_glitch',   'shaders/block_glitch.glsl'),
+    ('kaleidoscope',   'shaders/kaleidoscope.glsl'),
+    ('vortex',         'shaders/vortex.glsl'),
+    ('rgb_orbit',      'shaders/rgb_orbit.glsl'),
+    ('pixel_sort',     'shaders/pixel_sort.glsl'),
+    ('contour',        'shaders/contour.glsl'),
+    ('melt',           'shaders/melt.glsl'),
+    # ── page 2 (SOLO × 1) ─────────────────────────────────────────────────────
+    ('thermal',        'shaders/thermal.glsl'),
+    ('neon_glow',      'shaders/neon_glow.glsl'),
+    ('lens_warp',      'shaders/lens_warp.glsl'),
+    ('slit_scan',      'shaders/slit_scan.glsl'),
+    ('posterize',      'shaders/posterize.glsl'),
+    ('voronoi_shatter','shaders/voronoi_shatter.glsl'),
+    ('film_burn',      'shaders/film_burn.glsl'),
+    ('mirror_tile',    'shaders/mirror_tile.glsl'),
 ]
 
 # ── AKAI MIDI Mix factory mapping ─────────────────────────────────────────────
