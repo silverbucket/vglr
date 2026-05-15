@@ -80,11 +80,11 @@ Any `.mp4`, `.mkv`, or `.mov` file in a slot directory is used. If a slot has no
 | **BANK ◄ / ►** | Navigate video banks. Brief colour flash confirms the new bank. |
 | **SOLO** | Cycle through effect pages (page 1 = effects 1–8, page 2 = 9–16, …). Purple flash on change. |
 | **SEND ALL** | Save current slot settings to `settings.json` (effect, intensity, knob values). |
-| **Fader N** | Base/floor intensity for effect N — how much glitch is visible even at silence. |
+| **Fader N** | Ceiling intensity for effect N. Full down = effect off; full up = effect can reach full saturation. |
 | **Knob N row 1** | `param_a` — effect-specific (e.g. speed, segment count). |
 | **Knob N row 2** | `param_b` — effect-specific (e.g. scale, falloff). |
 | **Knob N row 3** | `param_c` — effect-specific (e.g. colour shift, zoom). |
-| **Master fader** | Audio sensitivity — how much the live signal amplifies the effect on top of the base level. |
+| **Master fader** | Signal normalizer (0–3× range). Raise for acoustic/quiet shows to amplify subtle audio; lower for loud/dense shows to preserve variation. Set at soundcheck. |
 
 The fader and knobs on strip N always control whichever effect is currently selected via MUTE N. Switching video slots (REC ARM) loads that slot's saved settings but does not change which strip is in control.
 

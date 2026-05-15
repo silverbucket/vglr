@@ -42,11 +42,12 @@ SOLO                 → cycle effect page (page 1 = effects 1–8, page 2 = 9�
 SEND ALL (top right) → save current slot settings to settings.json
                        detected via CC burst (fires all 33 CCs simultaneously);
                        CCs also re-sync hardware state as a side effect
-Fader (strip N)      → base/floor effect intensity for slot N (always-on glitch level)
+Fader (strip N)      → ceiling intensity for effect N (0=always off, 1=can fully saturate)
 Knob row 1 (strip N) → param_a  (shader-specific, e.g. speed)
 Knob row 2 (strip N) → param_b  (shader-specific, e.g. scale)
 Knob row 3 (strip N) → param_c  (shader-specific, e.g. colour shift)
-Master fader         → audio sensitivity (how much loud audio adds on top of base)
+Master fader         → signal normalizer: 0=silent, 127=3× amplification
+                       raise for acoustic/quiet shows, lower for loud/dense shows
 ```
 
 LEDs: active slot lit on REC ARM row; active effect lit on MUTE row (only when on matching page).
@@ -61,7 +62,7 @@ uniform float bass;           // 0.0–1.0, smoothed FFT energy 20–250 Hz
 uniform float mid;            // 250–4000 Hz
 uniform float treble;         // 4000+ Hz
 uniform float beat;           // spikes to 1.0 on onset, decays (BEAT_DECAY = 0.85)
-uniform float intensity;      // derived: base + audio_energy × (1-base) × sensitivity
+uniform float intensity;      // derived: fader × clamp(smooth_energy × master_scale, 0, 1)
 uniform float param_a;        // MIDI knob row 1
 uniform float param_b;        // MIDI knob row 2
 uniform float param_c;        // MIDI knob row 3
@@ -108,9 +109,14 @@ If no video exists for a slot, the previous clip keeps playing. Settings are per
 
 ## Audio → visual coupling
 
-- `intensity` = `base + smooth_energy × (1 - base) × sensitivity`
-  - `base` = fader (floor glitch level even at silence)
-  - `sensitivity` = master fader (how much audio amplitude adds on top)
+Active model: **ceiling-normalizer** — see `docs/intensity-models.md` for full history and rollback instructions.
+
+- `master_scale` = `master_fader × 3.0`  (MIDI 0–127 → 0–3× amplification)
+- `energy_scaled` = `clamp(smooth_energy × master_scale, 0, 1)`
+- `intensity` = `fader × energy_scaled`
+  - `fader` = ceiling (0 = always off; 1 = can reach full saturation with sufficient audio)
+  - `master_fader` = signal normalizer: raise for acoustic shows, lower for loud shows
+- `bass`, `mid`, `treble`, `beat` uniforms are all scaled by `master_scale` before shaders receive them
 - Beat detection: energy ratio threshold (`BEAT_THRESH = 1.8`)
 - Snappy attack (rate 0.4), slow release (rate 0.08) for smooth intensity envelope
 - Audio is stereo (2 channels from Zoom F1); mono = L+R average; `stereo_width` = abs(L−R)

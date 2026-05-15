@@ -474,22 +474,25 @@ class VGLRApp(mglw.WindowConfig):
                                    _bands['treble'], _bands['beat'],
                                    _bands['stereo_width'])
 
-        # Track fader = base/floor effect (always-on glitch even at silence).
-        # Master fader = audio sensitivity (how much loud audio adds on top).
-        # intensity = base + audio_energy × (1 - base) × sensitivity
-        base        = _slot_intensity
-        sensitivity = _m_master
-        raw_energy  = min(br * 2.5 + mr * 0.8 + tr * 0.4, 1.0)
+        # Model B — ceiling-normalizer (see docs/intensity-models.md)
+        # Track fader  = ceiling: max intensity the effect can reach (0=always off).
+        # Master fader = signal normalizer: MIDI 0→0×, MIDI 127→3× amplification.
+        #   Raise for acoustic/quiet shows; lower for loud/dense shows.
+        # intensity = fader × clamp(smooth_energy × master_scale, 0, 1)
+        # Bands also scaled so internal shader effects track master uniformly.
+        master_scale = _m_master * 3.0
+        raw_energy   = min(br * 2.5 + mr * 0.8 + tr * 0.4, 1.0)
         # Snappy attack, slow release so intensity lingers after a loud hit
         rate = 0.4 if raw_energy > self._smooth_energy else 0.08
         self._smooth_energy += rate * (raw_energy - self._smooth_energy)
-        intensity = min(base + self._smooth_energy * (1.0 - base) * sensitivity, 1.0)
+        energy_scaled = min(self._smooth_energy * master_scale, 1.0)
+        intensity     = _slot_intensity * energy_scaled
 
-        # Raw audio values go to shaders for parameter modulation (full 0-1 range).
-        bass   = float(br)
-        mid    = float(mr)
-        treble = float(tr)
-        beat   = float(bt)
+        ms     = master_scale
+        bass   = min(float(br) * ms, 1.0)
+        mid    = min(float(mr) * ms, 1.0)
+        treble = min(float(tr) * ms, 1.0)
+        beat   = min(float(bt) * ms, 1.0)
 
         if self._audio_timer >= 1.0:
             print(f"bass={bass:.3f}  mid={mid:.3f}  treble={treble:.3f}  "
