@@ -343,30 +343,35 @@ def _decode_loop() -> None:
     global _new_fps
     current = None
     while True:
-        target = _requested_video
-        if not target:
-            time.sleep(0.05)
-            continue
-        if target != current:
-            while not frame_queue.empty():
-                try:
-                    frame_queue.get_nowait()
-                except queue.Empty:
-                    break
-            current = target
-        with av.open(current) as container:
-            s = container.streams.video[0]
-            _new_fps = float(s.average_rate or s.guessed_rate or 30)
-            for frame in container.decode(video=0):
-                if _requested_video != current:
-                    break
-                if frame.width != _init_w or frame.height != _init_h:
-                    frame = frame.reformat(width=_init_w, height=_init_h)
-                try:
-                    frame_queue.put(frame.to_ndarray(format='rgb24'),
-                                    block=True, timeout=0.5)
-                except queue.Full:
-                    pass
+        try:
+            target = _requested_video
+            if not target:
+                time.sleep(0.05)
+                continue
+            if target != current:
+                while not frame_queue.empty():
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                current = target
+            with av.open(current) as container:
+                s = container.streams.video[0]
+                _new_fps = float(s.average_rate or s.guessed_rate or 30)
+                for frame in container.decode(video=0):
+                    if _requested_video != current:
+                        break
+                    if frame.width != _init_w or frame.height != _init_h:
+                        frame = frame.reformat(width=_init_w, height=_init_h)
+                    try:
+                        frame_queue.put(frame.to_ndarray(format='rgb24'),
+                                        block=True, timeout=0.5)
+                    except queue.Full:
+                        pass
+        except Exception as exc:
+            print(f"decode error ({current}): {exc}", flush=True)
+            current = None
+            time.sleep(0.5)
 
 
 # ── audio ─────────────────────────────────────────────────────────────────────

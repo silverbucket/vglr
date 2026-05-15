@@ -188,6 +188,7 @@ sudo systemctl status vglr.service
 | `sudo systemctl status vglr` | Show status and last few log lines |
 | `sudo journalctl -u vglr -f` | Live log tail |
 | `sudo journalctl -u vglr -n 100` | Last 100 log lines |
+| `sudo journalctl -u vglr -n 100 \| grep "decode error"` | Check for video decode crashes |
 | `sudo systemctl enable vglr` | Auto-start on boot |
 | `sudo systemctl disable vglr` | Disable auto-start |
 
