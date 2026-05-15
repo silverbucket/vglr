@@ -5,14 +5,14 @@ Description=vglr audio-reactive video glitch player
 After=sound.target local-fs.target
 
 [Service]
-User=nkj
-Group=nkj
-WorkingDirectory=/home/nkj/vglr
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/vglr
 
 # SDL2 must use KMS/DRM since there is no Wayland/X display.
 Environment=SDL_VIDEODRIVER=kmsdrm
 
-ExecStart=/home/nkj/vglr/venv/bin/python vglr.py --window sdl2 --fullscreen
+ExecStart=/home/YOUR_USERNAME/vglr/venv/bin/python vglr.py --window sdl2 --fullscreen
 
 # Restart automatically if the process exits unexpectedly (e.g. shader error).
 Restart=on-failure
