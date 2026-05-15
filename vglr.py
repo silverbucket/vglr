@@ -45,7 +45,7 @@ SHADERS = [
     ('lens_warp',      'shaders/lens_warp.glsl'),
     ('slit_scan',      'shaders/slit_scan.glsl'),
     ('posterize',      'shaders/posterize.glsl'),
-    ('voronoi_shatter','shaders/voronoi_shatter.glsl'),
+    ('tunnel_neon',    'shaders/tunnel_neon.glsl'),
     ('film_burn',      'shaders/film_burn.glsl'),
     ('mirror_tile',    'shaders/mirror_tile.glsl'),
 ]

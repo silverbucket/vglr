@@ -41,7 +41,7 @@ void main() {
     vec2 p = vec2(fract(uv.x + shift), uv.y);
 
     // Chromatic aberration: RGB channels split horizontally
-    float ca = param_b * 0.03 + mid * 0.012 + beat * 0.035;
+    float ca = param_b * 0.10 + mid * 0.012 + beat * 0.035;
     float r  = texture(video, vec2(fract(p.x + ca), p.y)).r;
     float g  = texture(video, p).g;
     float b  = texture(video, vec2(fract(p.x - ca), p.y)).b;

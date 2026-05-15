@@ -45,7 +45,7 @@ void main() {
     float bPhase = bass * 9.0;
     float shimmer = sin(uv.y * 28.0 + time * 7.3 + bPhase      ) * 0.007
                   + sin(uv.y * 11.0 + time * 3.1 + bPhase * 0.4) * 0.003;
-    float upDrift = (0.005 + param_b * 0.025 + beat * 0.04)
+    float upDrift = (0.005 + param_b * 0.07 + beat * 0.04)
                   * sin(uv.x * 13.0 + time * 0.9 + bPhase * 0.25);
 
     // Mid turbulence: unpredictable boiling at two spatial frequencies
@@ -55,7 +55,7 @@ void main() {
     vec2 convUV = uv + vec2(shimmer + turbX, -upDrift + turbY);
 
     // 5-tap bloom
-    float spread = 0.005 + param_b * 0.018 + bassSurge * 0.022;
+    float spread = 0.005 + param_b * 0.055 + bassSurge * 0.022;
     float lum = dot(texture(video, convUV).rgb, L);
     lum = max(lum, dot(texture(video, convUV + vec2( spread,  0.0  )).rgb, L));
     lum = max(lum, dot(texture(video, convUV + vec2(-spread,  0.0  )).rgb, L));

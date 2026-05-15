@@ -8,9 +8,9 @@ uniform float mid;
 uniform float treble;
 uniform float beat;
 uniform float intensity;  // fader: 0=clean passthrough, 1=full effect
-uniform float param_a;
-uniform float param_b;
-uniform float param_c;
+uniform float param_a;  // wiggle amount: 0=subtle jitter, 1=heavy tracking error
+uniform float param_b;  // colour smear / blur strength
+uniform float param_c;  // glitch density: 0=sparse events, 1=constant chaos
 
 in vec2 uv;
 out vec4 fragColor;
@@ -56,11 +56,13 @@ float onOff(float a, float b, float c, float framecount) {
     return step(c, sin((framecount * 0.001) + a*cos((framecount * 0.001)*b)));
 }
 
-vec2 jumpy(vec2 p, float framecount, float wiggle, float rf) {
+vec2 jumpy(vec2 p, float framecount, float wiggle, float rf, float density) {
     float window = 1.0/(1.0+80.0*(p.y-mod(framecount/4.0,1.0))*(p.y-mod(framecount/4.0,1.0)));
-    p.x += 0.05 * sin(p.y*10.0 + framecount)/20.0 * onOff(4.0,4.0,0.3,framecount)
+    float threshH = mix(0.65, 0.05, density);
+    float threshV = mix(0.95, 0.20, density);
+    p.x += 0.05 * sin(p.y*10.0 + framecount)/20.0 * onOff(4.0,4.0,threshH,framecount)
            * (0.5+cos(framecount*20.0)) * window * rf;
-    float vShift = (0.1*wiggle) * 0.4 * onOff(2.0,3.0,0.9,framecount)
+    float vShift = (0.1*wiggle) * 0.4 * onOff(2.0,3.0,threshV,framecount)
                    * (sin(framecount)*sin(framecount*20.0)
                    + (0.5 + 0.1*sin(framecount*200.0)*cos(framecount)));
     p.y = mod(p.y - 0.01 * vShift, 1.0);
@@ -71,13 +73,14 @@ void main() {
     float rf = min(resolution.y / 1080.0, 1.0);
 
     // audio modulation: bass drives wiggle, mid drives smear, beat spikes wiggle
-    float wiggle = 3.0 * rf * (1.0 + bass * 3.0) + beat * 4.0 * rf;
-    float smear  = 0.5 * rf * (1.0 + mid * 2.0 + treble * 3.0);
+    float wiggle = (0.5 + param_a * 5.5) * rf * (1.0 + bass * 3.0) + beat * (1.0 + param_a * 4.0) * rf;
+    float smear  = (0.05 + param_b * 0.95) * rf * (1.0 + mid * 2.0 + treble * 3.0);
+    float density = clamp(param_c + beat * 0.4, 0.0, 1.0);
 
     float framecount = time * 60.0;
     float d = 0.1 - ceil(mod(time/3.0, 1.0) + 0.5) * 0.1;
 
-    vec2 p = jumpy(uv, framecount, wiggle, rf);
+    vec2 p = jumpy(uv, framecount, wiggle, rf, density);
 
     // Unconditional audio distortion — always visible, not gated by onOff
     p.x += bass * 0.12 * sin(uv.y * 25.0 + time * 18.0);

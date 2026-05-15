@@ -43,7 +43,7 @@ void main() {
     // Chromatic aberration direction rotates over time
     float aberAngle = time * 0.38 + mid * 1.4;
     vec2  aberDir   = vec2(cos(aberAngle), sin(aberAngle));
-    float split     = param_b * 0.04 + treble * 0.02 + beat * 0.06;
+    float split     = param_b * 0.12 + treble * 0.02 + beat * 0.06;
 
     vec2 uvR = clamp(barrelUV(uv + aberDir *  split,        k * 1.15, focal, aspect), 0.001, 0.999);
     vec2 uvG = clamp(barrelUV(uv,                           k,        focal, aspect), 0.001, 0.999);

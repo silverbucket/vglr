@@ -116,7 +116,7 @@ Press **SOLO** to toggle between effect pages. Purple OSD flash confirms page ch
 | 3 | lens_warp | Barrel distortion + chromatic aberration; stereo width drives asymmetric pull | distortion strength | aberration split | vignette |
 | 4 | slit_scan | Scanline time-delay smear with rainbow colour separation | scan frequency | scan depth | colour spread |
 | 5 | posterize | Colour quantization + hue rotation; beat snaps to 2-level pop-art | colour levels | hue rotation speed | saturation boost |
-| 6 | voronoi_shatter | Cracked-glass cell tessellation; cells drift with audio, neon edges | cell scale | cell displacement | edge glow width |
+| 6 | tunnel_neon | Neon-lit spoke tunnel rushing toward viewer; beat strobes | spoke count | tunnel speed | video bleed |
 | 7 | film_burn | Cinematic halation, light leaks on beat, orange-teal grade, grain | halation strength | grade warmth | grain intensity |
 | 8 | mirror_tile | Tiled mirror from a Lissajous-roaming crop window; per-tile colour tint | crop window size | tile count | tint intensity |
 
