@@ -33,7 +33,7 @@ Stack: **Python + moderngl + PyAV + sounddevice + numpy + mido**
 ## AKAI MIDI Mix mapping
 
 ```
-MUTE buttons (1–8)   → select active shader/effect (from current effect page)
+MUTE buttons (1–8)   → toggle effect on/off (max 2 active at once; 3rd press ignored)
 REC ARM buttons (1–8)→ select video slot (1–8) within current bank
 BANK L / BANK R      → navigate video banks (bank1..bankN); OSD flash confirms
 SOLO                 → cycle effect page (page 1 = effects 1–8, page 2 = 9–16, …)
@@ -50,7 +50,8 @@ Master fader         → signal normalizer: 0=silent, 127=3× amplification
                        raise for acoustic/quiet shows, lower for loud/dense shows
 ```
 
-LEDs: active slot lit on REC ARM row; active effect lit on MUTE row (only when on matching page).
+LEDs: active slot lit on REC ARM row; all active effects lit on MUTE row (only those on the current page).
+Two effects active: effect A (lower index) renders first into an FBO; effect B reads that as its "video" input.
 
 ## Shader uniforms (standard across all shaders)
 

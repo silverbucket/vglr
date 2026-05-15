@@ -75,15 +75,15 @@ Any `.mp4`, `.mkv`, or `.mov` file in a slot directory is used. If a slot has no
 
 | Control | Function |
 |---------|----------|
-| **MUTE 1–8** | Select active effect (from the current effect page). Lit LED = active effect. |
+| **MUTE 1–8** | Toggle effect on/off (from the current effect page). Up to 2 effects can be active simultaneously. Lit LED = active. Press a lit button to deactivate; pressing a 3rd while 2 are active does nothing. |
 | **REC ARM 1–8** | Select video slot within the current bank. Lit LED = active slot. |
 | **BANK ◄ / ►** | Navigate video banks. Brief colour flash confirms the new bank. |
 | **SOLO** | Cycle through effect pages (page 1 = effects 1–8, page 2 = 9–16, …). Purple flash on change. |
-| **SEND ALL** | Save current slot settings to `settings.json` (effect, intensity, knob values). |
-| **Fader N** | Ceiling intensity for effect N. Full down = effect off; full up = effect can reach full saturation. |
-| **Knob N row 1** | `param_a` — effect-specific (e.g. speed, segment count). |
-| **Knob N row 2** | `param_b` — effect-specific (e.g. scale, falloff). |
-| **Knob N row 3** | `param_c` — effect-specific (e.g. colour shift, zoom). |
+| **SEND ALL** | Save current slot settings to `settings.json` (all active effects, their intensities and knob values). |
+| **Fader N** | Ceiling intensity for effect N. Always controls effect N on the current page, whether or not it is active. |
+| **Knob N row 1** | `param_a` for effect N — always live, even when effect N is not active. |
+| **Knob N row 2** | `param_b` for effect N. |
+| **Knob N row 3** | `param_c` for effect N. |
 | **Master fader** | Signal normalizer (0–3× range). Raise for acoustic/quiet shows to amplify subtle audio; lower for loud/dense shows to preserve variation. Set at soundcheck. |
 
 The fader and knobs on strip N always control whichever effect is currently selected via MUTE N. Switching video slots (REC ARM) loads that slot's saved settings but does not change which strip is in control.

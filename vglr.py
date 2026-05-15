@@ -56,7 +56,7 @@ MUTE      = [1,  4,  7,  10, 13, 16, 19, 22]   # Mute notes, strips 1-8
 SOLO      = 27
 BANK_L    = 25
 BANK_R    = 26
-SEND_ALL_BURST  = 32    # SEND ALL fires all 33 CCs; save after 32 so all effect CCs are synced first
+SEND_ALL_BURST  = 32    # SEND ALL fires all 33 CCs; save after 32
 SEND_ALL_WINDOW = 0.15  # seconds; CC burst window
 FADER_CC  = [19, 23, 27, 31, 49, 53, 57, 61]
 KNOB_CC   = [
@@ -76,9 +76,9 @@ BANK_COLORS = [
     (1.0, 0.55, 0.10),  # bank7  orange
     (0.90, 0.90, 0.90), # bank8  white
 ]
-OSD_DURATION = 2.0     # seconds the bank flash is visible
+OSD_DURATION = 2.0
 
-# ── per-slot defaults ─────────────────────────────────────────────────────────
+# ── defaults ──────────────────────────────────────────────────────────────────
 _DEFAULT_SETTINGS = {
     'shader':      'vhs',
     'intensity':   1.0,
@@ -87,27 +87,26 @@ _DEFAULT_SETTINGS = {
     'param_c':     0.4,
     'beat_thresh': 1.8,
 }
+_DEFAULT_EFFECT = {'intensity': 1.0, 'param_a': 0.5, 'param_b': 0.4, 'param_c': 0.4}
 
-# ── live state (MIDI thread writes, render thread reads; GIL keeps atomicity) ─
+# ── live state (MIDI thread writes, render thread reads; GIL as lock) ─────────
 _current_bank     = 1
 _current_slot     = 1
-_slot_shader_idx  = 0
-_slot_intensity   = 1.0
-_slot_param_a     = 0.5
-_slot_param_b     = 0.4
-_slot_param_c     = 0.4
+# Up to 2 active shader indices, sorted ascending.
+# MIDI thread mutates in place (append/remove/sort); render thread snapshots with list().
+_active_effects   = [0]
+# Per-shader params for every shader; always present so any strip can be tweaked
+# even before its effect is activated.
+_effect_params    = {i: dict(_DEFAULT_EFFECT) for i in range(len(SHADERS))}
 _slot_beat_thresh = 1.8
 _m_master         = 1.0
-_shader_req       = None   # render thread picks this up each frame
 _midi_out         = None
 
-# ── video state ───────────────────────────────────────────────────────────────
+# ── video / OSD state ─────────────────────────────────────────────────────────
 _requested_video = None
-_new_fps         = None    # render thread updates frame_interval when set
-
-# ── OSD state (set by MIDI thread, consumed by render thread) ─────────────────
-_osd_trigger     = None    # (r, g, b) colour tuple; render thread starts timer
-_effect_page     = 0       # which page of 8 shaders is visible on Mute buttons
+_new_fps         = None
+_osd_trigger     = None
+_effect_page     = 0
 
 # ── SEND ALL burst detection (MIDI thread only) ───────────────────────────────
 _cc_burst_count = 0
@@ -144,31 +143,62 @@ def _load_settings(bank: int, slot: int) -> dict:
 
 
 def _save_settings(bank: int, slot: int) -> None:
+    effects = [
+        {
+            'shader':    SHADERS[idx][0],
+            'intensity': _effect_params[idx]['intensity'],
+            'param_a':   _effect_params[idx]['param_a'],
+            'param_b':   _effect_params[idx]['param_b'],
+            'param_c':   _effect_params[idx]['param_c'],
+        }
+        for idx in sorted(_active_effects)
+    ]
+    first = effects[0] if effects else {}
     cfg = {
-        'shader':      SHADERS[_slot_shader_idx][0],
-        'intensity':   _slot_intensity,
-        'param_a':     _slot_param_a,
-        'param_b':     _slot_param_b,
-        'param_c':     _slot_param_c,
+        'effects':     effects,
+        # Legacy top-level keys for forward/backward compat with old format
+        'shader':      first.get('shader', 'vhs'),
+        'intensity':   first.get('intensity', 1.0),
+        'param_a':     first.get('param_a', 0.5),
+        'param_b':     first.get('param_b', 0.4),
+        'param_c':     first.get('param_c', 0.4),
         'beat_thresh': _slot_beat_thresh,
     }
     os.makedirs(_slot_dir(bank, slot), exist_ok=True)
     with open(_settings_path(bank, slot), 'w') as f:
         json.dump(cfg, f, indent=2)
-    print(f"saved: {_settings_path(bank, slot)}")
+    names = '+'.join(e['shader'] for e in effects)
+    print(f"saved: {_settings_path(bank, slot)}  ({names})")
 
 
 def _apply_settings(cfg: dict) -> None:
-    global _slot_shader_idx, _slot_intensity, _slot_param_a
-    global _slot_param_b, _slot_param_c, _slot_beat_thresh, _shader_req
-    idx = next((i for i, (n, _) in enumerate(SHADERS) if n == cfg['shader']), 0)
-    _slot_shader_idx  = idx
-    _slot_intensity   = cfg['intensity']
-    _slot_param_a     = cfg['param_a']
-    _slot_param_b     = cfg['param_b']
-    _slot_param_c     = cfg['param_c']
-    _slot_beat_thresh = cfg['beat_thresh']
-    _shader_req = idx
+    global _active_effects, _slot_beat_thresh
+    _slot_beat_thresh = cfg.get('beat_thresh', _DEFAULT_SETTINGS['beat_thresh'])
+
+    raw_effects = cfg.get('effects')
+    if raw_effects:
+        # New multi-effect format
+        new_active = []
+        for e in raw_effects[:2]:
+            idx = next((i for i, (n, _) in enumerate(SHADERS) if n == e.get('shader')), 0)
+            _effect_params[idx].update({
+                'intensity': e.get('intensity', _DEFAULT_EFFECT['intensity']),
+                'param_a':   e.get('param_a',   _DEFAULT_EFFECT['param_a']),
+                'param_b':   e.get('param_b',   _DEFAULT_EFFECT['param_b']),
+                'param_c':   e.get('param_c',   _DEFAULT_EFFECT['param_c']),
+            })
+            new_active.append(idx)
+        _active_effects = sorted(new_active)
+    else:
+        # Legacy single-effect format
+        idx = next((i for i, (n, _) in enumerate(SHADERS) if n == cfg.get('shader', 'vhs')), 0)
+        _effect_params[idx].update({
+            'intensity': cfg.get('intensity', _DEFAULT_EFFECT['intensity']),
+            'param_a':   cfg.get('param_a',   _DEFAULT_EFFECT['param_a']),
+            'param_b':   cfg.get('param_b',   _DEFAULT_EFFECT['param_b']),
+            'param_c':   cfg.get('param_c',   _DEFAULT_EFFECT['param_c']),
+        })
+        _active_effects = [idx]
 
 
 def _select_slot(bank: int, slot: int, flash_osd: bool = False) -> None:
@@ -182,12 +212,13 @@ def _select_slot(bank: int, slot: int, flash_osd: bool = False) -> None:
         print(f"slot: bank{bank}/video{slot}  {os.path.basename(video)}")
     else:
         print(f"slot: bank{bank}/video{slot}  (no video)")
-    print(f"  shader={SHADERS[_slot_shader_idx][0]}  intensity={_slot_intensity:.2f}")
+    names = '+'.join(SHADERS[i][0] for i in _active_effects)
+    print(f"  effects={names}")
     if flash_osd:
         _osd_trigger = BANK_COLORS[(bank - 1) % len(BANK_COLORS)]
     if _midi_out:
         _slot_leds(slot)
-        _effect_leds(_slot_shader_idx)
+        _effect_leds(_active_effects)
 
 
 # ── LED helpers ───────────────────────────────────────────────────────────────
@@ -202,11 +233,11 @@ def _slot_leds(active: int) -> None:
         _set_led(note, (i + 1) == active)
 
 
-def _effect_leds(active_idx: int) -> None:
+def _effect_leds(active_indices) -> None:
     page_start = _effect_page * 8
     for i in range(8):
-        on = (page_start + i) == active_idx and (page_start + i) < len(SHADERS)
-        _set_led(MUTE[i], on)
+        idx = page_start + i
+        _set_led(MUTE[i], idx in active_indices and idx < len(SHADERS))
 
 
 def _toggle_effect_page() -> None:
@@ -214,32 +245,39 @@ def _toggle_effect_page() -> None:
     pages = max(1, (len(SHADERS) + 7) // 8)
     _effect_page = (_effect_page + 1) % pages
     print(f"effect page: {_effect_page + 1}/{pages}")
-    _osd_trigger = (0.55, 0.2, 0.9)   # purple flash for page change
+    _osd_trigger = (0.55, 0.2, 0.9)
     if _midi_out:
-        _effect_leds(_slot_shader_idx)
+        _effect_leds(_active_effects)
 
 
 # ── MIDI ──────────────────────────────────────────────────────────────────────
 def _handle_midi(msg) -> None:
-    global _m_master, _slot_intensity, _slot_param_a, _slot_param_b, _slot_param_c
-    global _slot_shader_idx, _shader_req, _cc_burst_count, _cc_burst_time
+    global _m_master, _cc_burst_count, _cc_burst_time
 
     if msg.type in ('note_on', 'note_off'):
         if msg.type == 'note_off' or msg.velocity == 0:
             return
         note = msg.note
+
         for i, n in enumerate(RECARM):
             if note == n:
                 _select_slot(_current_bank, i + 1)
                 return
+
         for i, n in enumerate(MUTE):
             if note == n:
                 real_idx = _effect_page * 8 + i
-                if real_idx < len(SHADERS):
-                    _slot_shader_idx = real_idx
-                    _shader_req = real_idx
-                    _effect_leds(real_idx)
+                if real_idx >= len(SHADERS):
+                    return
+                if real_idx in _active_effects:
+                    _active_effects.remove(real_idx)
+                elif len(_active_effects) < 2:
+                    _active_effects.append(real_idx)
+                    _active_effects.sort()
+                # else: already at 2 active — ignore press
+                _effect_leds(_active_effects)
                 return
+
         if note == BANK_L:
             _select_slot(max(1, _current_bank - 1), _current_slot, flash_osd=True)
         elif note == BANK_R:
@@ -250,7 +288,7 @@ def _handle_midi(msg) -> None:
     elif msg.type == 'control_change':
         cc, v = msg.control, msg.value
 
-        # Detect SEND ALL: 33 CCs arrive in < 5ms; use it as save trigger.
+        # Detect SEND ALL: 33 CCs arrive in < 150ms
         now = time.monotonic()
         if now - _cc_burst_time > SEND_ALL_WINDOW:
             _cc_burst_count = 0
@@ -258,18 +296,22 @@ def _handle_midi(msg) -> None:
         _cc_burst_count += 1
         if _cc_burst_count == SEND_ALL_BURST:
             _save_settings(_current_bank, _current_slot)
-            # Fall through — let the CCs apply (they just re-sync hw state)
 
-        si = _slot_shader_idx % 8   # strip with the lit Mute button owns these controls
-        if cc == FADER_CC[si]:
-            _slot_intensity = v / 127.0
-        elif cc == KNOB_CC[si][0]:
-            _slot_param_a = v / 127.0
-        elif cc == KNOB_CC[si][1]:
-            _slot_param_b = v / 127.0
-        elif cc == KNOB_CC[si][2]:
-            _slot_param_c = v / 127.0
-        elif cc == MASTER_CC:
+        # Each strip independently controls its own effect on the current page.
+        # This works whether or not that effect is currently active.
+        for si in range(8):
+            effect_idx = _effect_page * 8 + si
+            if effect_idx >= len(SHADERS):
+                continue
+            if cc == FADER_CC[si]:
+                _effect_params[effect_idx]['intensity'] = v / 127.0
+                return
+            for k, key in enumerate(('param_a', 'param_b', 'param_c')):
+                if cc == KNOB_CC[si][k]:
+                    _effect_params[effect_idx][key] = v / 127.0
+                    return
+
+        if cc == MASTER_CC:
             _m_master = v / 127.0
 
 
@@ -287,7 +329,7 @@ def _midi_loop() -> None:
         with mido.open_output(out_name) as outport:
             _midi_out = outport
             _slot_leds(_current_slot)
-            _effect_leds(_slot_shader_idx)
+            _effect_leds(_active_effects)
             with mido.open_input(in_name) as inport:
                 for msg in inport:
                     _handle_midi(msg)
@@ -317,7 +359,6 @@ def _decode_loop() -> None:
             for frame in container.decode(video=0):
                 if _requested_video != current:
                     break
-                # Rescale if this video differs from the initial texture size
                 if frame.width != _init_w or frame.height != _init_h:
                     frame = frame.reformat(width=_init_w, height=_init_h)
                 try:
@@ -340,7 +381,7 @@ _energy_smooth = 0.0
 
 def _audio_callback(indata, frames, time_info, status):
     global _energy_smooth
-    mono  = indata.mean(axis=1)                                          # sum L+R
+    mono  = indata.mean(axis=1)
     width = min(float(np.mean(np.abs(indata[:, 0] - indata[:, 1]))) * GAIN, 1.0)
     fft    = np.abs(np.fft.rfft(mono, n=BLOCK_SIZE)) / BLOCK_SIZE
     bass   = min(float(np.mean(fft[_BASS_MASK]))   * GAIN, 1.0)
@@ -375,6 +416,14 @@ out vec4 fragColor;
 void main() { fragColor = osd_color; }
 """
 
+_PASSTHROUGH_FRAG = """
+#version 140
+uniform sampler2D video;
+in vec2 uv;
+out vec4 fragColor;
+void main() { fragColor = texture(video, uv); }
+"""
+
 QUAD = np.array([-1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0], dtype='f4')
 
 
@@ -395,31 +444,50 @@ class VGLRApp(mglw.WindowConfig):
         super().__init__(**kwargs)
         self._vbo = self.ctx.buffer(QUAD)
 
-        # Main video texture at the initial video size
+        # Main video texture
         self.texture = self.ctx.texture((_init_w, _init_h), 3)
         self.texture.use(location=0)
-        self.shader_idx = -1
-        self.prog = None
-        self._load_shader(_slot_shader_idx)
 
-        # OSD overlay program (full-screen coloured quad with alpha blending)
-        self._osd_prog = self.ctx.program(vertex_shader=VERT,
-                                          fragment_shader=_OSD_FRAG)
+        # Pre-compile all effect shaders at startup — no latency when toggling
+        self._progs = {}   # shader_idx -> (prog, vao)
+        for i, (name, path) in enumerate(SHADERS):
+            try:
+                with open(path) as f:
+                    frag = f.read()
+                prog = self.ctx.program(vertex_shader=VERT, fragment_shader=frag)
+                vao  = self.ctx.vertex_array(prog, [(self._vbo, '2f', 'in_position')])
+                _set_uniform(prog, 'video', 0)
+                self._progs[i] = (prog, vao)
+                print(f"compiled: {name}")
+            except Exception as exc:
+                print(f"shader error ({name}): {exc}")
+
+        # Passthrough — used when no effect is active
+        _pt_prog = self.ctx.program(vertex_shader=VERT, fragment_shader=_PASSTHROUGH_FRAG)
+        _pt_vao  = self.ctx.vertex_array(_pt_prog, [(self._vbo, '2f', 'in_position')])
+        _set_uniform(_pt_prog, 'video', 0)
+        self._passthrough_vao = _pt_vao
+
+        # OSD overlay
+        self._osd_prog = self.ctx.program(vertex_shader=VERT, fragment_shader=_OSD_FRAG)
         self._osd_vao  = self.ctx.vertex_array(self._osd_prog,
                                                [(self._vbo, '2f', 'in_position')])
         self._osd_timer = 0.0
         self._osd_color = (1.0, 1.0, 1.0)
 
-        global _shader_req, _new_fps
-        _shader_req = None
-        _new_fps    = None
+        # FBO for two-effect chain: effect A renders here, effect B reads it as "video"
+        self._fbo_tex = self.ctx.texture(self.wnd.size, 4)
+        self._fbo     = self.ctx.framebuffer(color_attachments=[self._fbo_tex])
+
+        global _new_fps
+        _new_fps = None
 
         self.frame_interval  = 1.0 / _init_fps
         self.last_frame_time = 0.0
         self._fps_frames     = 0
         self._fps_accum      = 0.0
         self._audio_timer    = 0.0
-        self._smooth_energy  = 0.0   # render-rate smoothing for intensity envelope
+        self._smooth_energy  = 0.0
 
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
@@ -430,31 +498,26 @@ class VGLRApp(mglw.WindowConfig):
         )
         self._stream.start()
 
-    def _load_shader(self, idx: int) -> None:
-        name, path = SHADERS[idx]
-        with open(path) as f:
-            frag = f.read()
-        if self.prog:
-            self.prog.release()
-        self.prog = self.ctx.program(vertex_shader=VERT, fragment_shader=frag)
-        self.vao  = self.ctx.vertex_array(self.prog, [(self._vbo, '2f', 'in_position')])
-        _set_uniform(self.prog, 'video', 0)
-        self.texture.use(location=0)
-        self.shader_idx = idx
-        print(f"shader: {name}")
+    def _set_effect_uniforms(self, prog, t, intensity, params, bass, mid, treble, beat, sw):
+        _set_uniform(prog, 'resolution',   self.wnd.size)
+        _set_uniform(prog, 'time',         t)
+        _set_uniform(prog, 'bass',         float(bass))
+        _set_uniform(prog, 'mid',          float(mid))
+        _set_uniform(prog, 'treble',       float(treble))
+        _set_uniform(prog, 'beat',         float(beat))
+        _set_uniform(prog, 'intensity',    float(intensity))
+        _set_uniform(prog, 'param_a',      float(params['param_a']))
+        _set_uniform(prog, 'param_b',      float(params['param_b']))
+        _set_uniform(prog, 'param_c',      float(params['param_c']))
+        _set_uniform(prog, 'stereo_width', float(sw))
 
     def on_render(self, time, frametime):
-        global _shader_req, _new_fps, _osd_trigger
-
-        if _shader_req is not None:
-            self._load_shader(_shader_req)
-            _shader_req = None
+        global _new_fps, _osd_trigger
 
         if _new_fps is not None:
             self.frame_interval = 1.0 / _new_fps
             _new_fps = None
 
-        # Start OSD timer when bank change is signalled
         if _osd_trigger is not None:
             self._osd_color = _osd_trigger
             self._osd_timer = OSD_DURATION
@@ -464,8 +527,9 @@ class VGLRApp(mglw.WindowConfig):
         self._fps_accum  += frametime
         self._audio_timer += frametime
         if self._fps_accum >= 5.0:
-            print(f"render: {self._fps_frames / self._fps_accum:.1f} fps  "
-                  f"shader: {SHADERS[self.shader_idx][0]}")
+            effects = list(_active_effects)
+            names   = '+'.join(SHADERS[i][0] for i in effects) if effects else 'none'
+            print(f"render: {self._fps_frames / self._fps_accum:.1f} fps  fx: {names}")
             self._fps_frames = 0
             self._fps_accum  = 0.0
 
@@ -475,18 +539,11 @@ class VGLRApp(mglw.WindowConfig):
                                    _bands['stereo_width'])
 
         # Model B — ceiling-normalizer (see docs/intensity-models.md)
-        # Track fader  = ceiling: max intensity the effect can reach (0=always off).
-        # Master fader = signal normalizer: MIDI 0→0×, MIDI 127→3× amplification.
-        #   Raise for acoustic/quiet shows; lower for loud/dense shows.
-        # intensity = fader × clamp(smooth_energy × master_scale, 0, 1)
-        # Bands also scaled so internal shader effects track master uniformly.
         master_scale = _m_master * 3.0
         raw_energy   = min(br * 2.5 + mr * 0.8 + tr * 0.4, 1.0)
-        # Snappy attack, slow release so intensity lingers after a loud hit
         rate = 0.4 if raw_energy > self._smooth_energy else 0.08
         self._smooth_energy += rate * (raw_energy - self._smooth_energy)
         energy_scaled = min(self._smooth_energy * master_scale, 1.0)
-        intensity     = _slot_intensity * energy_scaled
 
         ms     = master_scale
         bass   = min(float(br) * ms, 1.0)
@@ -496,22 +553,10 @@ class VGLRApp(mglw.WindowConfig):
 
         if self._audio_timer >= 1.0:
             print(f"bass={bass:.3f}  mid={mid:.3f}  treble={treble:.3f}  "
-                  f"beat={beat:.3f}  lvl={self._smooth_energy:.2f}  fx={intensity:.3f}")
+                  f"beat={beat:.3f}  lvl={self._smooth_energy:.2f}")
             self._audio_timer = 0.0
 
-        _set_uniform(self.prog, 'resolution', self.wnd.size)
-        _set_uniform(self.prog, 'time',       time)
-        _set_uniform(self.prog, 'bass',       float(bass))
-        _set_uniform(self.prog, 'mid',        float(mid))
-        _set_uniform(self.prog, 'treble',     float(treble))
-        _set_uniform(self.prog, 'beat',       float(beat))
-        _set_uniform(self.prog, 'intensity',  float(intensity))
-        _set_uniform(self.prog, 'param_a',    float(_slot_param_a))
-        _set_uniform(self.prog, 'param_b',    float(_slot_param_b))
-        _set_uniform(self.prog, 'param_c',       float(_slot_param_c))
-        _set_uniform(self.prog, 'stereo_width',  float(sw))
-
-        self.ctx.clear()
+        # Upload next video frame if due
         if time - self.last_frame_time >= self.frame_interval:
             try:
                 frame = frame_queue.get_nowait()
@@ -519,9 +564,60 @@ class VGLRApp(mglw.WindowConfig):
                 self.last_frame_time = time
             except queue.Empty:
                 pass
-        self.vao.render(moderngl.TRIANGLE_STRIP)
 
-        # OSD bank-change flash: alpha-blend a coloured overlay that fades out
+        effects = list(_active_effects)   # stable snapshot for this frame
+
+        if not effects:
+            # No effects active: show raw video
+            self.ctx.screen.use()
+            self.ctx.clear()
+            self.texture.use(location=0)
+            self._passthrough_vao.render(moderngl.TRIANGLE_STRIP)
+
+        elif len(effects) == 1:
+            idx = effects[0]
+            if idx in self._progs:
+                prog, vao = self._progs[idx]
+                params = _effect_params[idx]
+                self._set_effect_uniforms(
+                    prog, time, params['intensity'] * energy_scaled,
+                    params, bass, mid, treble, beat, sw)
+                self.ctx.screen.use()
+                self.ctx.clear()
+                self.texture.use(location=0)
+                vao.render(moderngl.TRIANGLE_STRIP)
+
+        else:
+            # Two effects: A → FBO, then B reads FBO as its "video" input
+            idx_a, idx_b = effects[0], effects[1]
+            if idx_a in self._progs and idx_b in self._progs:
+                prog_a, vao_a = self._progs[idx_a]
+                prog_b, vao_b = self._progs[idx_b]
+                params_a = _effect_params[idx_a]
+                params_b = _effect_params[idx_b]
+
+                # Pass 1: render effect A into FBO
+                self._fbo.use()
+                self._fbo.clear()
+                self._set_effect_uniforms(
+                    prog_a, time, params_a['intensity'] * energy_scaled,
+                    params_a, bass, mid, treble, beat, sw)
+                self.texture.use(location=0)
+                vao_a.render(moderngl.TRIANGLE_STRIP)
+
+                # Pass 2: render effect B to screen, feeding A's output as "video"
+                self.ctx.screen.use()
+                self.ctx.clear()
+                self._set_effect_uniforms(
+                    prog_b, time, params_b['intensity'] * energy_scaled,
+                    params_b, bass, mid, treble, beat, sw)
+                self._fbo_tex.use(location=0)
+                vao_b.render(moderngl.TRIANGLE_STRIP)
+
+                # Restore video texture binding for next frame upload
+                self.texture.use(location=0)
+
+        # OSD bank/page flash
         if self._osd_timer > 0:
             self._osd_timer -= frametime
             alpha = max(0.0, self._osd_timer / OSD_DURATION) * 0.45
