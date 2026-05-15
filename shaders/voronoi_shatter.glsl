@@ -9,7 +9,7 @@ uniform float treble;
 uniform float beat;
 uniform float intensity;
 uniform float param_a;  // cell scale: 0=large shards, 1=fine fragments
-uniform float param_b;  // displacement + blur intensity
+uniform float param_b;  // displacement intensity
 uniform float param_c;  // crack width
 
 in vec2 uv;
@@ -48,7 +48,7 @@ void main() {
                     sin(time * (0.26 + base.x * 0.65) * bassAnim),
                     cos(time * (0.19 + base.y * 0.58) * bassAnim)
                 )
-                + beat * 1.2 * (hash2(nb + vec2(3.7, 9.1)) * 2.0 - 1.0);
+                + beat * 1.2 * (fract(base + 0.5) * 2.0 - 1.0);
 
             float d = length(local - seed);
             if (d < minD) {
@@ -74,16 +74,6 @@ void main() {
     vec2  dispDir = normalize(local - bestSeedPos + vec2(0.001));
     vec2  sampleUV = fract(uv + dispDir * disp);
     vec3  col      = texture(video, sampleUV).rgb;
-
-    // Bass blur: high bass = cells vibrate (4-tap jitter simulates motion blur)
-    float blurAmt = smoothstep(0.2, 0.8, bass) * param_b * 0.8 + beat * 0.3;
-    float bOff    = blurAmt * 0.025;
-    vec3 blurred  = col;
-    blurred += texture(video, fract(sampleUV + vec2( bOff,   0.0))).rgb;
-    blurred += texture(video, fract(sampleUV + vec2(-bOff,   0.0))).rgb;
-    blurred += texture(video, fract(sampleUV + vec2(  0.0,  bOff))).rgb;
-    blurred += texture(video, fract(sampleUV + vec2(  0.0, -bOff))).rgb;
-    col = mix(col, blurred / 5.0, clamp(blurAmt, 0.0, 1.0));
 
     // Moderate desaturation — keep colour proportional to bass energy
     float grey = dot(col, vec3(0.299, 0.587, 0.114));
