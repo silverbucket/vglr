@@ -46,6 +46,8 @@ MUTE      = [1,  4,  7,  10, 13, 16, 19, 22]   # Mute notes, strips 1-8
 SOLO      = 27
 BANK_L    = 25
 BANK_R    = 26
+SEND_ALL_BURST  = 32    # SEND ALL fires all 33 CCs; save after 32 so all effect CCs are synced first
+SEND_ALL_WINDOW = 0.15  # seconds; CC burst window
 FADER_CC  = [19, 23, 27, 31, 49, 53, 57, 61]
 KNOB_CC   = [
     [16, 17, 18], [20, 21, 22], [24, 25, 26], [28, 29, 30],
@@ -95,6 +97,11 @@ _new_fps         = None    # render thread updates frame_interval when set
 
 # ── OSD state (set by MIDI thread, consumed by render thread) ─────────────────
 _osd_trigger     = None    # (r, g, b) colour tuple; render thread starts timer
+_effect_page     = 0       # which page of 8 shaders is visible on Mute buttons
+
+# ── SEND ALL burst detection (MIDI thread only) ───────────────────────────────
+_cc_burst_count = 0
+_cc_burst_time  = 0.0
 
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
@@ -186,14 +193,26 @@ def _slot_leds(active: int) -> None:
 
 
 def _effect_leds(active_idx: int) -> None:
-    for i, note in enumerate(MUTE[:len(SHADERS)]):
-        _set_led(note, i == active_idx)
+    page_start = _effect_page * 8
+    for i in range(8):
+        on = (page_start + i) == active_idx and (page_start + i) < len(SHADERS)
+        _set_led(MUTE[i], on)
+
+
+def _toggle_effect_page() -> None:
+    global _effect_page, _osd_trigger
+    pages = max(1, (len(SHADERS) + 7) // 8)
+    _effect_page = (_effect_page + 1) % pages
+    print(f"effect page: {_effect_page + 1}/{pages}")
+    _osd_trigger = (0.55, 0.2, 0.9)   # purple flash for page change
+    if _midi_out:
+        _effect_leds(_slot_shader_idx)
 
 
 # ── MIDI ──────────────────────────────────────────────────────────────────────
 def _handle_midi(msg) -> None:
     global _m_master, _slot_intensity, _slot_param_a, _slot_param_b, _slot_param_c
-    global _slot_shader_idx, _shader_req
+    global _slot_shader_idx, _shader_req, _cc_burst_count, _cc_burst_time
 
     if msg.type in ('note_on', 'note_off'):
         if msg.type == 'note_off' or msg.velocity == 0:
@@ -203,22 +222,35 @@ def _handle_midi(msg) -> None:
             if note == n:
                 _select_slot(_current_bank, i + 1)
                 return
-        for i, n in enumerate(MUTE[:len(SHADERS)]):
+        for i, n in enumerate(MUTE):
             if note == n:
-                _slot_shader_idx = i
-                _shader_req = i
-                _effect_leds(i)
+                real_idx = _effect_page * 8 + i
+                if real_idx < len(SHADERS):
+                    _slot_shader_idx = real_idx
+                    _shader_req = real_idx
+                    _effect_leds(real_idx)
                 return
         if note == BANK_L:
             _select_slot(max(1, _current_bank - 1), _current_slot, flash_osd=True)
         elif note == BANK_R:
             _select_slot(_current_bank + 1, _current_slot, flash_osd=True)
         elif note == SOLO:
-            _save_settings(_current_bank, _current_slot)
+            _toggle_effect_page()
 
     elif msg.type == 'control_change':
         cc, v = msg.control, msg.value
-        si = _current_slot - 1
+
+        # Detect SEND ALL: 33 CCs arrive in < 5ms; use it as save trigger.
+        now = time.monotonic()
+        if now - _cc_burst_time > SEND_ALL_WINDOW:
+            _cc_burst_count = 0
+            _cc_burst_time  = now
+        _cc_burst_count += 1
+        if _cc_burst_count == SEND_ALL_BURST:
+            _save_settings(_current_bank, _current_slot)
+            # Fall through — let the CCs apply (they just re-sync hw state)
+
+        si = _slot_shader_idx % 8   # strip with the lit Mute button owns these controls
         if cc == FADER_CC[si]:
             _slot_intensity = v / 127.0
         elif cc == KNOB_CC[si][0]:
@@ -292,13 +324,14 @@ _MID_MASK    = (_FREQS >= 250) & (_FREQS < 4000)
 _TREBLE_MASK = _FREQS >= 4000
 
 _lock          = threading.Lock()
-_bands         = {'bass': 0.0, 'mid': 0.0, 'treble': 0.0, 'beat': 0.0}
+_bands         = {'bass': 0.0, 'mid': 0.0, 'treble': 0.0, 'beat': 0.0, 'stereo_width': 0.0}
 _energy_smooth = 0.0
 
 
 def _audio_callback(indata, frames, time_info, status):
     global _energy_smooth
-    mono   = indata[:, 0]
+    mono  = indata.mean(axis=1)                                          # sum L+R
+    width = min(float(np.mean(np.abs(indata[:, 0] - indata[:, 1]))) * GAIN, 1.0)
     fft    = np.abs(np.fft.rfft(mono, n=BLOCK_SIZE)) / BLOCK_SIZE
     bass   = min(float(np.mean(fft[_BASS_MASK]))   * GAIN, 1.0)
     mid    = min(float(np.mean(fft[_MID_MASK]))    * GAIN, 1.0)
@@ -307,10 +340,11 @@ def _audio_callback(indata, frames, time_info, status):
     beat   = 1.0 if (_energy_smooth > 0 and energy > _energy_smooth * _slot_beat_thresh) else 0.0
     _energy_smooth = _energy_smooth * 0.9 + energy * 0.1
     with _lock:
-        _bands['bass']   += SMOOTH * (bass   - _bands['bass'])
-        _bands['mid']    += SMOOTH * (mid    - _bands['mid'])
-        _bands['treble'] += SMOOTH * (treble - _bands['treble'])
-        _bands['beat']    = max(_bands['beat'] * BEAT_DECAY, beat)
+        _bands['bass']         += SMOOTH * (bass   - _bands['bass'])
+        _bands['mid']          += SMOOTH * (mid    - _bands['mid'])
+        _bands['treble']       += SMOOTH * (treble - _bands['treble'])
+        _bands['beat']          = max(_bands['beat'] * BEAT_DECAY, beat)
+        _bands['stereo_width'] += SMOOTH * (width  - _bands['stereo_width'])
 
 
 # ── GL ────────────────────────────────────────────────────────────────────────
@@ -381,7 +415,7 @@ class VGLRApp(mglw.WindowConfig):
         threading.Thread(target=_midi_loop, daemon=True).start()
 
         self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype='float32',
+            samplerate=SAMPLE_RATE, channels=2, dtype='float32',
             blocksize=BLOCK_SIZE, device=AUDIO_DEVICE, callback=_audio_callback,
         )
         self._stream.start()
@@ -426,8 +460,9 @@ class VGLRApp(mglw.WindowConfig):
             self._fps_accum  = 0.0
 
         with _lock:
-            br, mr, tr, bt = (_bands['bass'], _bands['mid'],
-                               _bands['treble'], _bands['beat'])
+            br, mr, tr, bt, sw = (_bands['bass'], _bands['mid'],
+                                   _bands['treble'], _bands['beat'],
+                                   _bands['stereo_width'])
 
         # Track fader = base/floor effect (always-on glitch even at silence).
         # Master fader = audio sensitivity (how much loud audio adds on top).
@@ -460,7 +495,8 @@ class VGLRApp(mglw.WindowConfig):
         _set_uniform(self.prog, 'intensity',  float(intensity))
         _set_uniform(self.prog, 'param_a',    float(_slot_param_a))
         _set_uniform(self.prog, 'param_b',    float(_slot_param_b))
-        _set_uniform(self.prog, 'param_c',    float(_slot_param_c))
+        _set_uniform(self.prog, 'param_c',       float(_slot_param_c))
+        _set_uniform(self.prog, 'stereo_width',  float(sw))
 
         self.ctx.clear()
         if time - self.last_frame_time >= self.frame_interval:

@@ -8,113 +8,137 @@ Build an **audio-reactive video glitch player** for live shows / projections.
 - Apply GLSL shader effects (VHS, glitch, etc.) on top.
 - Modulate shader parameters in real time from live audio input (USB sound card).
 - Runs on **Raspberry Pi 5, 4GB RAM**, fullscreen output via DRM (no desktop), over HDMI to a projector.
-- Target: 1080p, fall back to 720p if perf demands.
 
 ## Hardware / OS
 
-- Raspberry Pi 5, 4GB RAM
-- Running headless, accessed over SSH
+- Raspberry Pi 5, 4GB RAM — headless, accessed over SSH
 - Output: HDMI to projector, fullscreen via DRM (no X/Wayland)
-- USB sound card for low-latency audio input (model TBD)
+- Audio input: **Zoom F1** field recorder as USB sound card (`AUDIO_DEVICE = 1`, hw:2,0)
+- MIDI controller: **AKAI MIDI Mix** (8-channel mixer form factor, USB)
 - User is on Arch-derivative Linux on desktop; Pi runs Raspberry Pi OS (Debian-based)
 
-## Current repo state
+## Current state — pipeline is fully working
 
+Run command on the Pi:
 ```
-vglr/
-├── shaders/
-│   ├── vhs.glsl           # WORKS with mpv (uses //!HOOK MAIN directives)
-│   └── vhs-glitch.glsl    # Godot format (shader_type canvas_item) — NOT mpv-compatible, ignore for now
-├── videos/
-│   └── fb_rev_wet_mop_reimagined.mp4   # 1080p H.264 test clip
-├── playlist.json
-└── vglr.py                # existing Python entry point — needs to be read & evaluated
+SDL_VIDEODRIVER=kmsdrm python vglr.py --window sdl2 --fullscreen
 ```
 
-## What we've learned so far (mpv exploration phase)
+Stack: **Python + moderngl + PyAV + sounddevice + numpy + mido**
 
-We initially tried using mpv as the shader runtime. Findings:
+- `vglr.py` — single-file entry point, all logic here
+- `shaders/` — GLSL 140 fragment shaders (8 currently loaded)
+- `videos/bank{N}/video{M}/` — video clip filesystem; slot settings stored as `settings.json` in same dir
 
-- `mpv --vo=gpu` **silently fails to load user shaders** on Pi (GLES profile too limited; libplacebo's `frame` uniform not provided in old VO).
-- `mpv --vo=gpu-next` **works** — uses libplacebo, compiles `//!HOOK`-style shaders correctly.
-- Working command:
-  ```
-  mpv --fullscreen --vo=gpu-next --gpu-context=drm \
-      --hwdec=v4l2m2m-copy \
-      --glsl-shaders=shaders/vhs.glsl --no-audio \
-      videos/fb_rev_wet_mop_reimagined.mp4
-  ```
-- **The blocker:** mpv user shaders **cannot receive live audio uniforms.** No hook for FFT/RMS/beat data into a running shader. You can only swap shaders or change parameters via IPC, which gives stepped/triggered reactivity, not continuous modulation.
-- Therefore, **mpv is being abandoned as the shader runtime** in favor of a custom Python pipeline.
-
-## Chosen architecture
-
-**Python + moderngl + PyAV + sounddevice + numpy**
+## AKAI MIDI Mix mapping
 
 ```
-┌─────────────────┐         ┌──────────────────┐
-│ Audio thread    │         │ Render thread    │
-│ (sounddevice)   │         │ (moderngl-window)│
-│                 │         │                  │
-│ mic → buffer →  │         │ loop:            │
-│ FFT → bands →   │ ──────► │  pyav.next_frame │
-│ shared state    │  audio  │  upload texture  │
-│                 │  values │  read audio vals │
-└─────────────────┘         │  set uniforms    │
-                            │  draw shader     │
-                            │  swap buffers    │
-                            └──────────────────┘
+MUTE buttons (1–8)   → select active shader/effect (from current effect page)
+REC ARM buttons (1–8)→ select video slot (1–8) within current bank
+BANK L / BANK R      → navigate video banks (bank1..bankN); OSD flash confirms
+SOLO                 → cycle effect page (page 1 = effects 1–8, page 2 = 9–16, …)
+                       purple OSD flash on page change; all Mute LEDs off if active
+                       effect is on a different page
+SEND ALL (top right) → save current slot settings to settings.json
+                       detected via CC burst (fires all 33 CCs simultaneously);
+                       CCs also re-sync hardware state as a side effect
+Fader (strip N)      → base/floor effect intensity for slot N (always-on glitch level)
+Knob row 1 (strip N) → param_a  (shader-specific, e.g. speed)
+Knob row 2 (strip N) → param_b  (shader-specific, e.g. scale)
+Knob row 3 (strip N) → param_c  (shader-specific, e.g. colour shift)
+Master fader         → audio sensitivity (how much loud audio adds on top of base)
 ```
 
-### Components
+LEDs: active slot lit on REC ARM row; active effect lit on MUTE row (only when on matching page).
 
-- **PyAV** (`av`) — decode video frames from disk. Use `h264_v4l2m2m` codec for Pi hardware decode.
-- **moderngl** — OpenGL wrapper. Upload each frame as a texture, run fragment shader with live uniforms, render to screen.
-- **moderngl-window** — handles window/fullscreen/main loop boilerplate. Use the EGL backend or DRM/KMS for fullscreen-without-desktop on the Pi.
-- **sounddevice** — captures from USB sound card via PortAudio. Non-blocking callback API, runs in its own thread.
-- **numpy** — FFT for frequency bands (bass/mid/treble); simple onset detection for beat triggers.
-- **aubio** (optional, later) — more robust beat/onset detection if numpy-based detection isn't tight enough.
-
-### Shader format
-
-Port existing `vhs.glsl` from mpv hook format to standard GLSL 330 fragment shader with these uniforms:
+## Shader uniforms (standard across all shaders)
 
 ```glsl
-uniform sampler2D video;
-uniform vec2 resolution;
+uniform sampler2D video;      // current video frame
+uniform vec2  resolution;
 uniform float time;
-uniform float bass;    // 0.0 - 1.0, smoothed
-uniform float mid;
-uniform float treble;
-uniform float beat;    // spikes to 1.0 on onset, decays exponentially
+uniform float bass;           // 0.0–1.0, smoothed FFT energy 20–250 Hz
+uniform float mid;            // 250–4000 Hz
+uniform float treble;         // 4000+ Hz
+uniform float beat;           // spikes to 1.0 on onset, decays (BEAT_DECAY = 0.85)
+uniform float intensity;      // derived: base + audio_energy × (1-base) × sensitivity
+uniform float param_a;        // MIDI knob row 1
+uniform float param_b;        // MIDI knob row 2
+uniform float param_c;        // MIDI knob row 3
+uniform float stereo_width;   // L–R channel difference, 0–1 (peaks on transient stereo events)
 ```
 
-Existing `vhs.glsl` uses `HOOKED_raw`, `HOOKED_pos`, `HOOKED_size`, `hook()` entry point — these need replacement with standard sampler/uv/main equivalents. Once ported, modulate existing parameters like `wiggle` and `smear` by audio bands (e.g. `wiggle *= (1.0 + bass * 3.0)`).
+All shaders use `#version 140` (Pi 5 Mesa V3D caps at OpenGL 3.1 Core — not 3.3).
 
-### Perf budget on Pi 5
+## Current shaders (slot order = MUTE button order)
 
-- 1080p H.264 decode via v4l2m2m: ~5% CPU, hardware-accelerated.
-- Single fragment shader pass at 1080p60: VideoCore VII handles `vhs.glsl`-complexity fine.
-- Audio FFT (1024 samples @ 48kHz): ~0.1ms in numpy.
-- Memory: ~300-500MB total. Comfortable on 4GB.
-- If perf becomes tight: drop to 720p, reduce shader complexity, or single-pass only.
+1. `vhs.glsl`         — VHS scan jitter, colour smear, Y/C noise
+2. `block_glitch.glsl`— rectangular block displacement
+3. `kaleidoscope.glsl`— radial mirror/tile
+4. `vortex.glsl`      — swirl/warp
+5. `rgb_orbit.glsl`   — RGB channel orbit/separation
+6. `pixel_sort.glsl`  — pixel sorting columns
+7. `contour.glsl`     — edge/contour detection overlay
+8. `melt.glsl`        — vertical melt/drip
 
-## Open questions / TODO for first session
+Also present but not in active rotation: `vhs-glitch.glsl` (Godot format, ignore), `vhs-tape-shader.glsl`, `morpholog.glsl`, `passthrough.glsl`.
 
-1. **Read `vglr.py`** — what does it currently do? Does it use mpv (now obsolete), or has it already started on a moderngl pipeline?
-2. **Decide: extend `vglr.py` or start fresh?** Depends on #1.
-3. **Identify the USB sound card** — `arecord -l` on the Pi.
-4. **Set up Python env** — venv with `moderngl moderngl-window av sounddevice numpy`. Pi OS may need `--break-system-packages` or `python3-venv`.
-5. **Build pipeline incrementally:**
-   - a. moderngl-window opens fullscreen, displays a static test pattern via shader.
-   - b. PyAV decodes video, feeds frames as textures into the moderngl loop.
-   - c. sounddevice captures audio, computes FFT bands, exposes shared state.
-   - d. Port `vhs.glsl` to standalone GLSL, wire audio uniforms in.
-6. **Fullscreen output on Pi without desktop** — moderngl-window's DRM/KMS or EGL backend. May need experimentation; SDL2 backend over DRM is a fallback.
+## Bank / slot filesystem
+
+```
+videos/
+  bank1/
+    video1/
+      clip.mp4
+      settings.json   ← shader name, intensity, param_a/b/c, beat_thresh
+    video2/
+      ...
+  bank2/
+    ...
+```
+
+If no video exists for a slot, the previous clip keeps playing. Settings are per-slot and saved on SOLO press.
+
+## Performance (measured on Pi 5)
+
+- **720p output, 7-sample blur** → ~15 fps (current working config)
+- 1080p untested with complex shaders; likely ~10 fps
+- Audio FFT at 1024 samples/44.1kHz: ~0.1ms
+- `GAIN = 200.0` currently; tune per venue
+
+## Audio → visual coupling
+
+- `intensity` = `base + smooth_energy × (1 - base) × sensitivity`
+  - `base` = fader (floor glitch level even at silence)
+  - `sensitivity` = master fader (how much audio amplitude adds on top)
+- Beat detection: energy ratio threshold (`BEAT_THRESH = 1.8`)
+- Snappy attack (rate 0.4), slow release (rate 0.08) for smooth intensity envelope
+- Audio is stereo (2 channels from Zoom F1); mono = L+R average; `stereo_width` = abs(L−R)
+- `stereo_width` peaks on transient stereo events (cymbals, room reverb, panned hits)
+
+## Architecture
+
+```
+┌─────────────────┐         ┌──────────────────┐    ┌──────────────┐
+│ Audio thread    │         │ Render thread    │    │ MIDI thread  │
+│ (sounddevice)   │         │ (moderngl-window)│    │ (mido)       │
+│                 │         │                  │    │              │
+│ mic → FFT →     │──────►  │ pyav frame →     │◄── │ knobs/faders │
+│ bass/mid/treble │ bands   │ texture upload   │    │ → uniforms   │
+│ beat detection  │         │ uniforms → shader│    │ buttons →    │
+└─────────────────┘         │ render quad      │    │ slot/bank    │
+                            └──────────────────┘    └──────────────┘
+```
+
+## Known constraints & decisions
+
+- **No mpv** — abandoned because mpv user shaders can't receive live audio uniforms.
+- **OpenGL 3.1 only** — Pi 5 Mesa V3D 7.1.10.2 hard cap. Use `gl_version = (3, 1)` and `#version 140` everywhere.
+- **SDL2/KMS backend** — `SDL_VIDEODRIVER=kmsdrm` required for fullscreen without desktop.
+- **GIL as lock** — audio/MIDI threads write simple floats; Python GIL provides sufficient atomicity for these reads.
 
 ## User preferences
 
-- Linux power user (Arch background)
-- Comfortable with SSH-only workflow
+- Linux power user (Arch background), comfortable with SSH-only workflow
 - Wants direct file editing, not copy-paste from chat
-- Will test on actual hardware
+- Tests on actual Pi hardware
