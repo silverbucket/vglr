@@ -33,35 +33,38 @@ void main() {
     cx += stereo_width * 0.07 * sin(time * 2.3);
     vec2 focal = vec2(cx, cy);
 
-    // Beat zoom snap: fisheye kick that decays
-    float snap = beat * 0.85 * exp(-beat * 3.2);
-    float k    = 0.06 + param_a * 0.44 + bass * 0.28 + snap;
+    // Bass distortion via smoothstep — nothing at silence, aggressive on kick
+    float bassK = smoothstep(0.1, 0.55, bass) * 1.4;
+    // Beat snap: use beat directly — it already decays via BEAT_DECAY each frame
+    // (Previous exp(-beat*3.2) evaluated to ~0.034 at beat=1, killing the effect)
+    float snap  = beat * 3.0;
+    float k     = 0.03 + param_a * 0.55 + bassK + snap;
 
-    // Chromatic aberration direction rotates over time (not just horizontal)
+    // Chromatic aberration direction rotates over time
     float aberAngle = time * 0.38 + mid * 1.4;
     vec2  aberDir   = vec2(cos(aberAngle), sin(aberAngle));
-    float split     = param_b * 0.017 + treble * 0.007 + beat * 0.012;
+    float split     = param_b * 0.04 + treble * 0.02 + beat * 0.06;
 
-    vec2 uvR = clamp(barrelUV(uv + aberDir *  split,        k * 1.12, focal, aspect), 0.001, 0.999);
+    vec2 uvR = clamp(barrelUV(uv + aberDir *  split,        k * 1.15, focal, aspect), 0.001, 0.999);
     vec2 uvG = clamp(barrelUV(uv,                           k,        focal, aspect), 0.001, 0.999);
-    vec2 uvB = clamp(barrelUV(uv - aberDir *  split * 0.8,  k * 0.90, focal, aspect), 0.001, 0.999);
+    vec2 uvB = clamp(barrelUV(uv - aberDir *  split * 0.8,  k * 0.88, focal, aspect), 0.001, 0.999);
 
     float r = texture(video, uvR).r;
     float g = texture(video, uvG).g;
     float b = texture(video, uvB).b;
     vec3 col = vec3(r, g, b);
 
-    // Rolling scan flare: thin bright line sweeping down the frame
+    // Rolling scan flare
     float flareY = fract(time * 0.21 + mid * 0.09);
     float flare  = smoothstep(0.010, 0.0, abs(uv.y - flareY)) * (0.45 + bass * 0.75);
     col += vec3(flare * 0.85, flare * 0.65, flare * 0.35);
 
-    // Vignette from focal point (drifts with it)
+    // Vignette from focal point
     float dist = length((uv - focal) * vec2(1.0, 1.0 / aspect));
     float vignette = 1.0 - dist * (1.1 + param_c * 1.9 + bass * 0.3);
     col *= clamp(vignette, 0.0, 1.0);
 
-    // Treble prismatic fringing at edges
+    // Treble prismatic fringing
     float prism = treble * 0.35 * dist * dist;
     col.r = clamp(col.r + prism * 0.22, 0.0, 1.0);
     col.b = clamp(col.b - prism * 0.16, 0.0, 1.0);

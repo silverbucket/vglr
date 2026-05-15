@@ -35,19 +35,27 @@ vec3 icePalette(float t) {
 void main() {
     vec3 L = vec3(0.299, 0.587, 0.114);
 
-    // Palette breathes on two incommensurate oscillators — never repeats
-    float breathe = 0.5 + 0.5 * sin(time * 0.23) * sin(time * 0.31);
-    float thresh  = 0.38 - param_c * 0.34 - breathe * 0.14;
+    // Palette breathes on two incommensurate oscillators
+    float breathe   = 0.5 + 0.5 * sin(time * 0.23) * sin(time * 0.31);
+    // Bass surge fires earlier and drops threshold harder
+    float bassSurge = smoothstep(0.1, 0.5, bass);
+    float thresh    = 0.38 - param_c * 0.34 - breathe * 0.14 - bassSurge * 0.22;
 
-    // Heat convection: UV rises in hot areas, shimmers sideways at two scales
-    float shimmer = sin(uv.y * 28.0 + time * 7.3)  * 0.004
-                  + sin(uv.y * 11.0 + time * 3.1)  * 0.002;
-    float upDrift = (0.004 + param_b * 0.018 + smoothstep(0.15, 0.7, bass) * 0.028)
-                  * sin(uv.x * 13.0 + time * 0.9);
-    vec2 convUV = uv + vec2(shimmer, -upDrift);
+    // Bass shifts the PHASE of the warp rather than its size — changes character, not scale
+    float bPhase = bass * 9.0;
+    float shimmer = sin(uv.y * 28.0 + time * 7.3 + bPhase      ) * 0.007
+                  + sin(uv.y * 11.0 + time * 3.1 + bPhase * 0.4) * 0.003;
+    float upDrift = (0.005 + param_b * 0.025 + beat * 0.04)
+                  * sin(uv.x * 13.0 + time * 0.9 + bPhase * 0.25);
 
-    // 5-tap bloom: max luminance in a cross
-    float spread = 0.005 + param_b * 0.018 + smoothstep(0.15, 0.7, bass) * 0.022;
+    // Mid turbulence: unpredictable boiling at two spatial frequencies
+    float turbX = mid * 0.012 * sin(uv.y * 17.0 + time * 4.1) * sin(uv.x *  9.0 + time * 2.3);
+    float turbY = mid * 0.012 * cos(uv.x * 13.0 + time * 3.7) * cos(uv.y *  7.0 + time * 1.9);
+
+    vec2 convUV = uv + vec2(shimmer + turbX, -upDrift + turbY);
+
+    // 5-tap bloom
+    float spread = 0.005 + param_b * 0.018 + bassSurge * 0.022;
     float lum = dot(texture(video, convUV).rgb, L);
     lum = max(lum, dot(texture(video, convUV + vec2( spread,  0.0  )).rgb, L));
     lum = max(lum, dot(texture(video, convUV + vec2(-spread,  0.0  )).rgb, L));
@@ -55,18 +63,27 @@ void main() {
     lum = max(lum, dot(texture(video, convUV + vec2( 0.0,    -spread)).rgb, L));
 
     float heat = clamp((lum - thresh) / (1.0 - thresh + 0.01), 0.0, 1.0);
-    heat = min(heat + beat * 0.55, 1.0);
+    heat = min(heat + beat * 0.65, 1.0);
 
-    vec3 fire = firePalette(heat);
-    vec3 ice  = icePalette(heat);
+    // Palette slowly drifts with accumulated energy — beats advance it, silence drifts it back
+    // Rate: ~0.015/s base + 0.04/s per beat + bass contribution → full cycle ~20-60s
+    float colorDrift  = fract(time * 0.015 + beat * 0.08 + bass * 0.025);
+    float heatOffset  = sin(colorDrift * 6.2832) * 0.18;   // offset cycles through the palette
+    float heatShifted = clamp(heat + heatOffset, 0.0, 1.0);
+
+    vec3 fire = firePalette(heatShifted);
+    vec3 ice  = icePalette(heatShifted);
     vec3 col  = mix(fire, ice, param_a);
 
-    // Treble flickers the hottest pixels rapidly
-    float flicker = 1.0 + treble * 0.4 * sin(time * 65.0 + uv.x * 38.0);
-    col *= mix(1.0, flicker, smoothstep(0.4, 0.75, heat));
+    // Treble flickers hot pixels more aggressively
+    float flicker = 1.0 + treble * 0.8 * sin(time * 65.0 + uv.x * 38.0);
+    col *= mix(1.0, flicker, smoothstep(0.35, 0.7, heat));
 
-    // Mid rolls a slow complementary hue across the image
-    col = mix(col, col.gbr, mid * 0.22 * sin(time * 3.7 * sin(time * 0.19) + uv.y * 6.0));
+    // Mid rolls a slow complementary hue
+    col = mix(col, col.gbr, mid * 0.30 * sin(time * 3.7 * sin(time * 0.19) + uv.y * 6.0));
+
+    // Beat: white surge on hottest pixels
+    col = mix(col, vec3(1.0), beat * 0.3 * smoothstep(0.5, 0.9, heat));
 
     fragColor = mix(texture(video, uv), vec4(clamp(col, 0.0, 1.0), 1.0), intensity);
 }
