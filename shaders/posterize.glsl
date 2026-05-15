@@ -8,7 +8,7 @@ uniform float mid;
 uniform float treble;
 uniform float beat;
 uniform float intensity;
-uniform float param_a;  // colour levels: 0=2 (harshest), 1=12 (rich)
+uniform float param_a;  // colour levels: 0=2 (harshest posterize), 1=10 (rich)
 uniform float param_b;  // hue rotation speed
 uniform float param_c;  // saturation boost
 
@@ -29,31 +29,51 @@ vec3 hsv2rgb(vec3 c) {
     return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
 }
 
-float hash(vec2 p) {
-    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
-}
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 
 void main() {
     vec3 col = texture(video, uv).rgb;
+    float lum = dot(col, vec3(0.299, 0.587, 0.114));
 
-    // Quantize: beat snaps down to 2-level Warhol graphic, bass pumps it back up
-    float levels = max(2.0, floor(2.0 + param_a * 10.0 + bass * 4.0 - beat * 4.5));
-    col = floor(col * levels + 0.5) / levels;
+    // Per-channel quantization: each channel gets different levels
+    float baseL = max(2.0, floor(2.0 + param_a * 8.0 + bass * 3.0 - beat * 4.5));
+    float levR  = max(2.0, baseL + floor(mid    * 2.5) - 1.0);
+    float levG  = baseL;
+    float levB  = max(2.0, baseL - floor(treble * 1.8) + 1.0);
+    col.r = floor(col.r * levR + 0.5) / levR;
+    col.g = floor(col.g * levG + 0.5) / levG;
+    col.b = floor(col.b * levB + 0.5) / levB;
 
-    // HSV: rotate hue, boost saturation
+    // Per-luminance-band hue: shadows, midtones, highlights each shift independently
+    float speed    = 0.06 + param_b * 0.18;
+    float hueShadow    = fract(time * speed + 0.0);
+    float hueMidtone   = fract(time * speed + 0.33 + mid  * 0.22);
+    float hueHighlight = fract(time * speed + 0.67 - bass * 0.18);
+
     vec3 hsv = rgb2hsv(col);
-    float hueShift = time * 0.07 * (0.2 + param_b * 0.9) + mid * 0.35;
-    hsv.x = fract(hsv.x + hueShift);
-    hsv.y = clamp(hsv.y * (1.6 + param_c * 2.2), 0.0, 1.0);
+    float hueShift = mix(hueShadow,   hueMidtone,   smoothstep(0.0,  0.45, lum));
+    hueShift       = mix(hueShift,    hueHighlight, smoothstep(0.5,  1.0,  lum));
+    hsv.x = fract(hsv.x + hueShift * 0.55);
+    hsv.y = clamp(hsv.y * (1.5 + param_c * 2.2), 0.0, 1.0);
     col = hsv2rgb(hsv);
 
-    // Dithering at colour boundaries (visible on treble)
-    float noise  = (hash(uv * resolution) - 0.5) * treble * 0.18 / max(levels, 1.0);
-    col = clamp(col + noise, 0.0, 1.0);
+    // Halftone: dot radius grows with bass
+    float dotScale = 55.0 + bass * 90.0;
+    vec2  dotGrid  = fract(uv * dotScale) - 0.5;
+    float dotR     = 0.14 + bass * 0.30 + lum * 0.12;
+    float dotMask  = step(length(dotGrid), dotR);
+    float dotMix   = (0.08 + bass * 0.38) * (1.0 - lum * 0.4);
+    col = mix(col, col * dotMask, dotMix);
 
-    // Beat: second quantization flash in complementary hue
-    vec3 hsvComp = vec3(fract(hsv.x + 0.5), hsv.y, hsv.z);
-    col = mix(col, hsv2rgb(hsvComp), beat * 0.5);
+    // Beat: Warhol snap to 2-level complementary flash
+    vec3 compFlash = vec3(floor(col.r * 2.0 + 0.5) / 2.0,
+                          floor((1.0 - col.g) * 2.0 + 0.5) / 2.0,
+                          0.5);
+    col = mix(col, compFlash, beat * 0.55);
+
+    // Treble dithering at quantization edges
+    float noise = (hash(uv * resolution) - 0.5) * treble * 0.14 / max(baseL, 1.0);
+    col = clamp(col + noise, 0.0, 1.0);
 
     fragColor = mix(texture(video, uv), vec4(col, 1.0), intensity);
 }
