@@ -6,6 +6,7 @@ import queue
 import random
 import sys
 import time
+from time import monotonic as _monotonic
 import threading
 import numpy as np
 import moderngl
@@ -265,19 +266,11 @@ def _handle_midi(msg) -> None:
         pressed = msg.type == 'note_on' and msg.velocity > 0
         note    = msg.note
 
-        # ── reset combo hold tracking ──────────────────────────────────────────
+        # ── reset combo hold tracking (trigger polled in render loop) ───────────
         if note in _RESET_NOTES:
             if pressed:
                 _reset_held[note] = time.monotonic()
             else:
-                if len(_reset_held) == 3 and note in _reset_held:
-                    # all_held_since = when the last of the three was pressed
-                    all_held_since = max(_reset_held.values())
-                    if time.monotonic() - all_held_since >= _RESET_HOLD_S:
-                        print("reset combo held — restarting", flush=True)
-                        for n in MUTE + RECARM:
-                            _set_led(n, False)
-                        sys.exit(1)
                 _reset_held.pop(note, None)
         # ── end reset combo ───────────────────────────────────────────────────
 
@@ -570,6 +563,22 @@ class VGLRApp(mglw.WindowConfig):
 
     def on_render(self, time, frametime):
         global _new_fps, _osd_trigger
+
+        # ── MIDI reset combo poll ─────────────────────────────────────────────
+        held = dict(_reset_held)
+        now  = _monotonic()
+        # Evict stale entries (pressed > 10 s ago without completing the combo)
+        _reset_held.update({k: v for k, v in held.items() if now - v <= 10.0})
+        for k in [k for k, v in held.items() if now - v > 10.0]:
+            _reset_held.pop(k, None)
+        if (len(held) == 3 and
+                all(k in held for k in _RESET_NOTES) and
+                now - max(held.values()) >= _RESET_HOLD_S):
+            print("reset combo held — restarting", flush=True)
+            for n in MUTE + RECARM:
+                _set_led(n, False)
+            os._exit(1)
+        # ─────────────────────────────────────────────────────────────────────
 
         if _new_fps is not None:
             self.frame_interval = 1.0 / _new_fps
