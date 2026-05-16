@@ -29,7 +29,7 @@ GAIN         = 200.0  # higher = more sensitive; tune per venue
 SMOOTH       = 0.3
 BEAT_DECAY   = 0.85
 
-FALLBACK_VIDEO = 'videos/fb_rev_wet_mop_reimagined.mp4'
+FALLBACK_VIDEO = 'videos/bank1/video1/Americana.mp4'
 
 # ── auto-effect tuning ────────────────────────────────────────────────────────
 # How quickly the momentum tracker responds to energy changes.
@@ -47,7 +47,7 @@ AUTO_BEAT_THRESHOLD    = 0.5
 # Minimum activate probability per beat (even at silence / flat energy).
 AUTO_P_ON_FLOOR        = 0.05
 # How much building momentum adds to activate probability. Total max = FLOOR + this.
-AUTO_P_ON_MOMENTUM     = 0.55
+AUTO_P_ON_MOMENTUM     = 0.40
 
 # Minimum deactivate probability per beat (even while energy is building).
 AUTO_P_OFF_FLOOR       = 0.05
