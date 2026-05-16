@@ -65,6 +65,9 @@ AUTO_BLEND_RATE        = 2.5
 # At 1.0 the auto effect fully covers the A/B output at peak blend.
 AUTO_BLEND_MAX         = 0.75
 
+# How long (seconds) to hold a MUTE button before solo-preview activates.
+PREVIEW_HOLD_S         = 1.0
+
 # ── shaders (name, path) — 8 slots map to 8 Mute buttons ─────────────────────
 SHADERS = [
     # ── page 1 (SOLO × 0) ─────────────────────────────────────────────────────
@@ -157,6 +160,7 @@ _reset_held: dict = {}   # note → press_time (MIDI thread only)
 # ── auto-effect probabilistic accent layer ────────────────────────────────────
 _auto_effects:   set  = set()   # effect indices in probabilistic mode
 _dbl_click_time: dict = {}      # MUTE note → last press time (double-click detection)
+_mute_hold_time: dict = {}      # MUTE note → press time (solo-preview hold detection)
 
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
@@ -304,16 +308,20 @@ def _slot_leds(active: int) -> None:
         _set_led(note, (i + 1) == active)
 
 
-def _effect_leds(active_indices, auto_phase: bool = True) -> None:
+def _effect_leds(active_indices, slow_phase: bool = True, fast_phase: bool = True,
+                 preview_idx: int | None = None) -> None:
     page_start = _effect_page * 8
     for i in range(8):
         idx = page_start + i
         if idx >= len(SHADERS):
             _set_led(MUTE[i], False)
+        elif preview_idx is not None:
+            # Preview active: only the previewed LED fast-flashes; everything else off
+            _set_led(MUTE[i], fast_phase if idx == preview_idx else False)
         elif idx in active_indices:
-            _set_led(MUTE[i], True)             # stable active: solid
+            _set_led(MUTE[i], True)              # stable active: solid
         elif idx in _auto_effects:
-            _set_led(MUTE[i], auto_phase)       # auto pool: blink
+            _set_led(MUTE[i], slow_phase)        # auto/trigger pool: slow blink
         else:
             _set_led(MUTE[i], False)
 
@@ -343,6 +351,14 @@ def _handle_midi(msg) -> None:
             else:
                 _reset_held.pop(note, None)
         # ── end reset combo ───────────────────────────────────────────────────
+
+        # ── solo-preview hold tracking ────────────────────────────────────────
+        if note in MUTE:
+            if pressed:
+                _mute_hold_time[note] = time.monotonic()
+            else:
+                _mute_hold_time.pop(note, None)
+        # ─────────────────────────────────────────────────────────────────────
 
         if not pressed:
             return
@@ -662,9 +678,14 @@ class VGLRApp(mglw.WindowConfig):
         self._prev_se           = 0.0    # previous smooth_energy for momentum
         self._momentum          = 0.0    # smoothed dE/dt
 
-        # LED blink state (driven from render loop so auto LEDs can flash)
+        # LED blink state (driven from render loop so auto/preview LEDs can flash)
+        # Tick at 8 Hz; slow_phase toggles at 1 Hz, fast_phase at 4 Hz.
         self._led_tick  = 0.0
-        self._led_phase = False
+        self._led_count = 0
+
+        # Solo-preview state
+        self._preview_idx     = None   # effect currently being previewed (or None)
+        self._preview_entered = False  # True on the first frame of preview (triggers OSD)
 
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
@@ -809,13 +830,29 @@ class VGLRApp(mglw.WindowConfig):
                                    self._auto_blend - AUTO_BLEND_RATE * frametime)
         # ─────────────────────────────────────────────────────────────────────
 
-        # ── LED blink tick (drives auto-effect flashing LEDs) ─────────────────
+        # ── solo-preview detection ────────────────────────────────────────────
+        prev_preview = self._preview_idx
+        self._preview_idx = None
+        now_p = _monotonic()
+        for i, n in enumerate(MUTE):
+            press_t = _mute_hold_time.get(n)
+            if press_t and now_p - press_t >= PREVIEW_HOLD_S:
+                self._preview_idx = _effect_page * 8 + i
+                break
+        if self._preview_idx is not None and prev_preview is None:
+            self._preview_entered = True   # first frame: trigger OSD flash
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── LED blink tick (8 Hz; slow=1 Hz, fast=4 Hz) ──────────────────────
         self._led_tick += frametime
-        if self._led_tick >= 0.25:   # 4 Hz
-            self._led_tick  = 0.0
-            self._led_phase = not self._led_phase
-            if _auto_effects and _midi_out:
-                _effect_leds(_active_effects, auto_phase=self._led_phase)
+        if self._led_tick >= 0.125:   # 8 Hz
+            self._led_tick  -= 0.125
+            self._led_count += 1
+            slow_phase = bool(self._led_count % 8 < 4)   # on 4 ticks, off 4 → 1 Hz
+            fast_phase = bool(self._led_count % 2 == 0)  # on 1 tick,  off 1 → 4 Hz
+            if (_auto_effects or self._preview_idx is not None) and _midi_out:
+                _effect_leds(_active_effects, slow_phase=slow_phase,
+                             fast_phase=fast_phase, preview_idx=self._preview_idx)
         # ─────────────────────────────────────────────────────────────────────
 
         # For single-effect or final-screen render: choose normal or flip progs.
@@ -823,7 +860,21 @@ class VGLRApp(mglw.WindowConfig):
 
         effects = list(_active_effects)   # stable snapshot for this frame
 
-        if not effects:
+        # ── solo-preview render override ──────────────────────────────────────
+        if self._preview_idx is not None and self._preview_idx in self._progs:
+            if self._preview_entered:
+                _osd_trigger = (1.0, 0.55, 0.0)   # orange flash on entry
+                self._preview_entered = False
+            prog, vao = self._progs[self._preview_idx]
+            params = _effect_params[self._preview_idx]
+            self.ctx.screen.use()
+            self.ctx.clear()
+            self.texture.use(location=0)
+            self._set_effect_uniforms(prog, time, params['intensity'] * energy_scaled,
+                                      params, bass, mid, treble, beat, sw)
+            vao.render(moderngl.TRIANGLE_STRIP)
+            # Skip normal render + auto accent; jump straight to OSD
+        elif not effects:
             # No effects active: show raw video
             self.ctx.screen.use()
             self.ctx.clear()
@@ -875,10 +926,10 @@ class VGLRApp(mglw.WindowConfig):
                 # Restore video texture binding for next frame upload
                 self.texture.use(location=0)
 
-        # ── auto-effect accent blend ──────────────────────────────────────────
+        # ── auto-effect accent blend (skipped during solo preview) ───────────
         # Render auto effect on original video into FBO2, then blend over screen.
         # Uses _progs_flip for correct orientation (same double-flip logic as pass 1).
-        if self._auto_blend > 0.001 and self._auto_current in self._progs_flip:
+        if self._preview_idx is None and self._auto_blend > 0.001 and self._auto_current in self._progs_flip:
             prog_auto, vao_auto = self._progs_flip[self._auto_current]
             params_auto = _effect_params[self._auto_current]
             self._fbo2.use()
