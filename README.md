@@ -85,6 +85,7 @@ Any `.mp4`, `.mkv`, or `.mov` file in a slot directory is used. If a slot has no
 | **Knob N row 2** | `param_b` for effect N. |
 | **Knob N row 3** | `param_c` for effect N. |
 | **Master fader** | Signal normalizer (0–3× range). Raise for acoustic/quiet shows to amplify subtle audio; lower for loud/dense shows to preserve variation. Set at soundcheck. |
+| **MUTE 1 + BANK ◄ + BANK ► (hold 2 s)** | Emergency restart — hold all three simultaneously for 2 seconds. All LEDs go dark and the service restarts (~3 s). Use if video navigation stops responding. |
 
 The fader and knobs on strip N always control whichever effect is currently selected via MUTE N. Switching video slots (REC ARM) loads that slot's saved settings but does not change which strip is in control.
 

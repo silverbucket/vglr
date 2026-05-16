@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import random
+import sys
 import time
 import threading
 import numpy as np
@@ -112,6 +113,11 @@ _effect_page     = 0
 # ── SEND ALL burst detection (MIDI thread only) ───────────────────────────────
 _cc_burst_count = 0
 _cc_burst_time  = 0.0
+
+# ── MIDI reset combo: hold MUTE-1 + BANK_L + BANK_R for 2 s ──────────────────
+_RESET_NOTES  = frozenset({MUTE[0], BANK_L, BANK_R})
+_RESET_HOLD_S = 2.0
+_reset_held: dict = {}   # note → press_time (MIDI thread only)
 
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
@@ -253,10 +259,29 @@ def _toggle_effect_page() -> None:
 
 # ── MIDI ──────────────────────────────────────────────────────────────────────
 def _handle_midi(msg) -> None:
-    global _m_master, _cc_burst_count, _cc_burst_time
+    global _m_master, _cc_burst_count, _cc_burst_time, _reset_held
 
     if msg.type in ('note_on', 'note_off'):
-        if msg.type == 'note_off' or msg.velocity == 0:
+        pressed = msg.type == 'note_on' and msg.velocity > 0
+        note    = msg.note
+
+        # ── reset combo hold tracking ──────────────────────────────────────────
+        if note in _RESET_NOTES:
+            if pressed:
+                _reset_held[note] = time.monotonic()
+            else:
+                if len(_reset_held) == 3 and note in _reset_held:
+                    # all_held_since = when the last of the three was pressed
+                    all_held_since = max(_reset_held.values())
+                    if time.monotonic() - all_held_since >= _RESET_HOLD_S:
+                        print("reset combo held — restarting", flush=True)
+                        for n in MUTE + RECARM:
+                            _set_led(n, False)
+                        sys.exit(1)
+                _reset_held.pop(note, None)
+        # ── end reset combo ───────────────────────────────────────────────────
+
+        if not pressed:
             return
         note = msg.note
 
