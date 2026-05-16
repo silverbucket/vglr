@@ -47,7 +47,7 @@ AUTO_BEAT_THRESHOLD    = 0.5
 # Minimum activate probability per beat (even at silence / flat energy).
 AUTO_P_ON_FLOOR        = 0.05
 # How much building momentum adds to activate probability. Total max = FLOOR + this.
-AUTO_P_ON_MOMENTUM     = 0.40
+AUTO_P_ON_MOMENTUM     = 0.10
 
 # Minimum deactivate probability per beat (even while energy is building).
 AUTO_P_OFF_FLOOR       = 0.05
