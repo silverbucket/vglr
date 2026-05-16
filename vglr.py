@@ -79,7 +79,7 @@ BANK_COLORS = [
     (1.0, 0.55, 0.10),  # bank7  orange
     (0.90, 0.90, 0.90), # bank8  white
 ]
-OSD_DURATION = 2.0
+OSD_DURATION = 1.5
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 _DEFAULT_SETTINGS = {
@@ -451,8 +451,16 @@ void main() {
 _OSD_FRAG = """
 #version 140
 uniform vec4 osd_color;
+in vec2 uv;
 out vec4 fragColor;
-void main() { fragColor = osd_color; }
+void main() {
+    // Distance from nearest edge (0 at border, 0.5 at centre)
+    float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    // Glow that's full-strength at the border and fades inward over ~20% of the screen
+    float vignette = 1.0 - smoothstep(0.0, 0.20, edge);
+    vignette = pow(vignette, 0.7);
+    fragColor = vec4(osd_color.rgb, osd_color.a * vignette);
+}
 """
 
 _PASSTHROUGH_FRAG = """
@@ -700,7 +708,7 @@ class VGLRApp(mglw.WindowConfig):
         # OSD bank/page flash
         if self._osd_timer > 0:
             self._osd_timer -= frametime
-            alpha = max(0.0, self._osd_timer / OSD_DURATION) * 0.45
+            alpha = max(0.0, self._osd_timer / OSD_DURATION) * 0.90
             self._osd_prog['osd_color'] = (*self._osd_color, alpha)
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
