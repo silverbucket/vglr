@@ -120,6 +120,10 @@ _RESET_NOTES  = frozenset({MUTE[0], BANK_L, BANK_R})
 _RESET_HOLD_S = 2.0
 _reset_held: dict = {}   # note → press_time (MIDI thread only)
 
+# ── auto-effect probabilistic accent layer ────────────────────────────────────
+_auto_effects:   set  = set()   # effect indices in probabilistic mode
+_dbl_click_time: dict = {}      # MUTE note → last press time (double-click detection)
+
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
 
@@ -162,8 +166,20 @@ def _save_settings(bank: int, slot: int) -> None:
         for idx in sorted(_active_effects)
     ]
     first = effects[0] if effects else {}
+    auto = [
+        {
+            'shader':    SHADERS[idx][0],
+            'intensity': _effect_params[idx]['intensity'],
+            'param_a':   _effect_params[idx]['param_a'],
+            'param_b':   _effect_params[idx]['param_b'],
+            'param_c':   _effect_params[idx]['param_c'],
+        }
+        for idx in sorted(_auto_effects)
+        if idx < len(SHADERS)
+    ]
     cfg = {
-        'effects':     effects,
+        'effects':      effects,
+        'auto_effects': auto,
         # Legacy top-level keys for forward/backward compat with old format
         'shader':      first.get('shader', 'vhs'),
         'intensity':   first.get('intensity', 1.0),
@@ -180,7 +196,7 @@ def _save_settings(bank: int, slot: int) -> None:
 
 
 def _apply_settings(cfg: dict) -> None:
-    global _active_effects, _slot_beat_thresh
+    global _active_effects, _slot_beat_thresh, _auto_effects
     _slot_beat_thresh = cfg.get('beat_thresh', _DEFAULT_SETTINGS['beat_thresh'])
 
     raw_effects = cfg.get('effects')
@@ -207,6 +223,19 @@ def _apply_settings(cfg: dict) -> None:
             'param_c':   cfg.get('param_c',   _DEFAULT_EFFECT['param_c']),
         })
         _active_effects = [idx]
+
+    # Restore auto-effect pool
+    _auto_effects.clear()
+    for e in cfg.get('auto_effects', []):
+        idx = next((i for i, (n, _) in enumerate(SHADERS) if n == e.get('shader')), None)
+        if idx is not None:
+            _effect_params[idx].update({
+                'intensity': e.get('intensity', _DEFAULT_EFFECT['intensity']),
+                'param_a':   e.get('param_a',   _DEFAULT_EFFECT['param_a']),
+                'param_b':   e.get('param_b',   _DEFAULT_EFFECT['param_b']),
+                'param_c':   e.get('param_c',   _DEFAULT_EFFECT['param_c']),
+            })
+            _auto_effects.add(idx)
 
 
 def _select_slot(bank: int, slot: int, flash_osd: bool = False) -> None:
@@ -241,11 +270,18 @@ def _slot_leds(active: int) -> None:
         _set_led(note, (i + 1) == active)
 
 
-def _effect_leds(active_indices) -> None:
+def _effect_leds(active_indices, auto_phase: bool = True) -> None:
     page_start = _effect_page * 8
     for i in range(8):
         idx = page_start + i
-        _set_led(MUTE[i], idx in active_indices and idx < len(SHADERS))
+        if idx >= len(SHADERS):
+            _set_led(MUTE[i], False)
+        elif idx in active_indices:
+            _set_led(MUTE[i], True)             # stable active: solid
+        elif idx in _auto_effects:
+            _set_led(MUTE[i], auto_phase)       # auto pool: blink
+        else:
+            _set_led(MUTE[i], False)
 
 
 def _toggle_effect_page() -> None:
@@ -260,7 +296,7 @@ def _toggle_effect_page() -> None:
 
 # ── MIDI ──────────────────────────────────────────────────────────────────────
 def _handle_midi(msg) -> None:
-    global _m_master, _cc_burst_count, _cc_burst_time, _reset_held
+    global _m_master, _cc_burst_count, _cc_burst_time, _reset_held, _active_effects
 
     if msg.type in ('note_on', 'note_off'):
         pressed = msg.type == 'note_on' and msg.velocity > 0
@@ -288,6 +324,23 @@ def _handle_midi(msg) -> None:
                 real_idx = _effect_page * 8 + i
                 if real_idx >= len(SHADERS):
                     return
+                now_t = time.monotonic()
+                last_t = _dbl_click_time.get(n, 0.0)
+                _dbl_click_time[n] = now_t
+
+                if now_t - last_t < 0.35:
+                    # Double-click: toggle auto mode
+                    _dbl_click_time[n] = 0.0   # reset so triple-click is a fresh single
+                    if real_idx in _auto_effects:
+                        _auto_effects.discard(real_idx)
+                    else:
+                        _active_effects = [e for e in _active_effects if e != real_idx]
+                        _auto_effects.add(real_idx)
+                    _effect_leds(_active_effects)
+                    return
+
+                # Single click: stable toggle (also exits auto mode if already there)
+                _auto_effects.discard(real_idx)
                 if real_idx in _active_effects:
                     _active_effects.remove(real_idx)
                 elif len(_active_effects) < 2:
@@ -463,6 +516,17 @@ void main() {
 }
 """
 
+_AUTO_BLEND_FRAG = """
+#version 140
+uniform sampler2D overlay;
+uniform float blend_alpha;
+in vec2 uv;
+out vec4 fragColor;
+void main() {
+    fragColor = vec4(texture(overlay, uv).rgb, blend_alpha);
+}
+"""
+
 _PASSTHROUGH_FRAG = """
 #version 140
 uniform sampler2D video;
@@ -534,6 +598,15 @@ class VGLRApp(mglw.WindowConfig):
         self._fbo_tex = self.ctx.texture(self.wnd.size, 4)
         self._fbo     = self.ctx.framebuffer(color_attachments=[self._fbo_tex])
 
+        # FBO2 for auto-effect accent layer: rendered on original video, blended over screen
+        self._fbo2_tex = self.ctx.texture(self.wnd.size, 4)
+        self._fbo2     = self.ctx.framebuffer(color_attachments=[self._fbo2_tex])
+        self._auto_blend_prog = self.ctx.program(
+            vertex_shader=VERT, fragment_shader=_AUTO_BLEND_FRAG)
+        self._auto_blend_vao  = self.ctx.vertex_array(
+            self._auto_blend_prog, [(self._vbo, '2f', 'in_position')])
+        self._auto_blend_prog['overlay'] = 1   # texture unit 1
+
         global _new_fps
         _new_fps = None
 
@@ -546,6 +619,18 @@ class VGLRApp(mglw.WindowConfig):
         self._flip_active     = False  # True while beat-triggered flip is on
         self._flip_timer      = 0.0   # counts down; flip holds until this hits 0
         self._prev_beat_high  = False  # rising-edge detection for beat onset
+
+        # Auto-effect accent layer state
+        self._auto_current      = None   # effect index currently in accent slot (or None)
+        self._auto_blend        = 0.0    # current mix factor (smoothly ramped)
+        self._auto_blend_target = 0.0    # 1.0 when accent active, 0.0 when not
+        self._auto_beat_prev    = False  # beat edge detection
+        self._prev_se           = 0.0    # previous smooth_energy for momentum
+        self._momentum          = 0.0    # smoothed dE/dt
+
+        # LED blink state (driven from render loop so auto LEDs can flash)
+        self._led_tick  = 0.0
+        self._led_phase = False
 
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
@@ -648,6 +733,58 @@ class VGLRApp(mglw.WindowConfig):
         self._flip_timer  = max(0.0, self._flip_timer - frametime)
         self._flip_active = self._flip_timer > 0.0
 
+        # ── auto-effect probability logic ─────────────────────────────────────
+        # Momentum: smoothed derivative of smooth_energy (positive = building)
+        delta = self._smooth_energy - self._prev_se
+        self._momentum = self._momentum * 0.85 + delta * 0.15
+        self._prev_se  = self._smooth_energy
+        # Normalise momentum to 0..1: 0 = falling, 0.5 = flat, 1 = building fast
+        momentum_norm = min(max(self._momentum * 25.0 + 0.5, 0.0), 1.0)
+
+        auto_beat = float(bt) > 0.5
+        if auto_beat and not self._auto_beat_prev and _auto_effects:
+            if self._auto_current is None:
+                # Chance to activate scales with momentum (building energy → more likely)
+                p_on = 0.05 + momentum_norm * 0.55
+                if random.random() < p_on:
+                    self._auto_current      = random.choice(list(_auto_effects))
+                    self._auto_blend_target = 1.0
+            else:
+                # Chance to deactivate scales with falling energy
+                p_off = 0.05 + (1.0 - momentum_norm) * 0.40
+                if random.random() < p_off:
+                    self._auto_current      = None
+                    self._auto_blend_target = 0.0
+                elif len(_auto_effects) > 1 and random.random() < 0.15:
+                    # Occasionally drift to a different effect in the pool
+                    candidates = [e for e in _auto_effects if e != self._auto_current]
+                    self._auto_current = random.choice(candidates)
+        self._auto_beat_prev = auto_beat
+
+        # If pool was cleared externally (slot change), retire active auto effect
+        if self._auto_current is not None and self._auto_current not in _auto_effects:
+            self._auto_current      = None
+            self._auto_blend_target = 0.0
+
+        # Smooth blend ramp (0→1 in ~0.4s, 1→0 in ~0.4s)
+        BLEND_RATE = 2.5
+        if self._auto_blend < self._auto_blend_target:
+            self._auto_blend = min(self._auto_blend_target,
+                                   self._auto_blend + BLEND_RATE * frametime)
+        else:
+            self._auto_blend = max(self._auto_blend_target,
+                                   self._auto_blend - BLEND_RATE * frametime)
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── LED blink tick (drives auto-effect flashing LEDs) ─────────────────
+        self._led_tick += frametime
+        if self._led_tick >= 0.25:   # 4 Hz
+            self._led_tick  = 0.0
+            self._led_phase = not self._led_phase
+            if _auto_effects and _midi_out:
+                _effect_leds(_active_effects, auto_phase=self._led_phase)
+        # ─────────────────────────────────────────────────────────────────────
+
         # For single-effect or final-screen render: choose normal or flip progs.
         screen_progs = self._progs_flip if self._flip_active else self._progs
 
@@ -704,6 +841,30 @@ class VGLRApp(mglw.WindowConfig):
 
                 # Restore video texture binding for next frame upload
                 self.texture.use(location=0)
+
+        # ── auto-effect accent blend ──────────────────────────────────────────
+        # Render auto effect on original video into FBO2, then blend over screen.
+        # Uses _progs_flip for correct orientation (same double-flip logic as pass 1).
+        if self._auto_blend > 0.001 and self._auto_current in self._progs_flip:
+            prog_auto, vao_auto = self._progs_flip[self._auto_current]
+            params_auto = _effect_params[self._auto_current]
+            self._fbo2.use()
+            self._fbo2.clear()
+            self._set_effect_uniforms(
+                prog_auto, time, params_auto['intensity'] * energy_scaled,
+                params_auto, bass, mid, treble, beat, sw)
+            self.texture.use(location=0)   # original video
+            vao_auto.render(moderngl.TRIANGLE_STRIP)
+
+            self.ctx.screen.use()
+            self._fbo2_tex.use(location=1)
+            self._auto_blend_prog['blend_alpha'].value = self._auto_blend * 0.75
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self._auto_blend_vao.render(moderngl.TRIANGLE_STRIP)
+            self.ctx.disable(moderngl.BLEND)
+            self.texture.use(location=0)   # restore
+        # ─────────────────────────────────────────────────────────────────────
 
         # OSD bank/page flash
         if self._osd_timer > 0:
