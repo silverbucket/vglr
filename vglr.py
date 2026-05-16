@@ -31,6 +31,40 @@ BEAT_DECAY   = 0.85
 
 FALLBACK_VIDEO = 'videos/fb_rev_wet_mop_reimagined.mp4'
 
+# ── auto-effect tuning ────────────────────────────────────────────────────────
+# How quickly the momentum tracker responds to energy changes.
+# Higher = smoother/slower; lower = snappier but jittery. Range 0–1.
+AUTO_MOMENTUM_SMOOTH   = 0.85
+
+# Scales how much energy swing is needed to shift momentum from 0 to 1.
+# Lower = small swings move the needle; higher = only big drops/builds matter.
+AUTO_MOMENTUM_SCALE    = 25.0
+
+# Beat amplitude threshold (pre-master) that triggers auto probability rolls.
+# 0.5 = medium beats; lower = reacts to quieter beats too.
+AUTO_BEAT_THRESHOLD    = 0.5
+
+# Minimum activate probability per beat (even at silence / flat energy).
+AUTO_P_ON_FLOOR        = 0.05
+# How much building momentum adds to activate probability. Total max = FLOOR + this.
+AUTO_P_ON_MOMENTUM     = 0.55
+
+# Minimum deactivate probability per beat (even while energy is building).
+AUTO_P_OFF_FLOOR       = 0.05
+# How much falling momentum adds to deactivate probability. Total max = FLOOR + this.
+AUTO_P_OFF_MOMENTUM    = 0.40
+
+# Probability per beat of drifting to a different effect within the auto pool.
+# Only applies when the pool has more than one effect.
+AUTO_P_DRIFT           = 0.15
+
+# Blend transition speed: higher = snappier fade in/out (2.5 ≈ 0.4s to full).
+AUTO_BLEND_RATE        = 2.5
+
+# Maximum opacity of the accent layer (0.0–1.0).
+# At 1.0 the auto effect fully covers the A/B output at peak blend.
+AUTO_BLEND_MAX         = 0.75
+
 # ── shaders (name, path) — 8 slots map to 8 Mute buttons ─────────────────────
 SHADERS = [
     # ── page 1 (SOLO × 0) ─────────────────────────────────────────────────────
@@ -736,26 +770,26 @@ class VGLRApp(mglw.WindowConfig):
         # ── auto-effect probability logic ─────────────────────────────────────
         # Momentum: smoothed derivative of smooth_energy (positive = building)
         delta = self._smooth_energy - self._prev_se
-        self._momentum = self._momentum * 0.85 + delta * 0.15
+        self._momentum = self._momentum * AUTO_MOMENTUM_SMOOTH + delta * (1.0 - AUTO_MOMENTUM_SMOOTH)
         self._prev_se  = self._smooth_energy
         # Normalise momentum to 0..1: 0 = falling, 0.5 = flat, 1 = building fast
-        momentum_norm = min(max(self._momentum * 25.0 + 0.5, 0.0), 1.0)
+        momentum_norm = min(max(self._momentum * AUTO_MOMENTUM_SCALE + 0.5, 0.0), 1.0)
 
-        auto_beat = float(bt) > 0.5
+        auto_beat = float(bt) > AUTO_BEAT_THRESHOLD
         if auto_beat and not self._auto_beat_prev and _auto_effects:
             if self._auto_current is None:
                 # Chance to activate scales with momentum (building energy → more likely)
-                p_on = 0.05 + momentum_norm * 0.55
+                p_on = AUTO_P_ON_FLOOR + momentum_norm * AUTO_P_ON_MOMENTUM
                 if random.random() < p_on:
                     self._auto_current      = random.choice(list(_auto_effects))
                     self._auto_blend_target = 1.0
             else:
                 # Chance to deactivate scales with falling energy
-                p_off = 0.05 + (1.0 - momentum_norm) * 0.40
+                p_off = AUTO_P_OFF_FLOOR + (1.0 - momentum_norm) * AUTO_P_OFF_MOMENTUM
                 if random.random() < p_off:
                     self._auto_current      = None
                     self._auto_blend_target = 0.0
-                elif len(_auto_effects) > 1 and random.random() < 0.15:
+                elif len(_auto_effects) > 1 and random.random() < AUTO_P_DRIFT:
                     # Occasionally drift to a different effect in the pool
                     candidates = [e for e in _auto_effects if e != self._auto_current]
                     self._auto_current = random.choice(candidates)
@@ -766,14 +800,13 @@ class VGLRApp(mglw.WindowConfig):
             self._auto_current      = None
             self._auto_blend_target = 0.0
 
-        # Smooth blend ramp (0→1 in ~0.4s, 1→0 in ~0.4s)
-        BLEND_RATE = 2.5
+        # Smooth blend ramp
         if self._auto_blend < self._auto_blend_target:
             self._auto_blend = min(self._auto_blend_target,
-                                   self._auto_blend + BLEND_RATE * frametime)
+                                   self._auto_blend + AUTO_BLEND_RATE * frametime)
         else:
             self._auto_blend = max(self._auto_blend_target,
-                                   self._auto_blend - BLEND_RATE * frametime)
+                                   self._auto_blend - AUTO_BLEND_RATE * frametime)
         # ─────────────────────────────────────────────────────────────────────
 
         # ── LED blink tick (drives auto-effect flashing LEDs) ─────────────────
@@ -858,7 +891,7 @@ class VGLRApp(mglw.WindowConfig):
 
             self.ctx.screen.use()
             self._fbo2_tex.use(location=1)
-            self._auto_blend_prog['blend_alpha'].value = self._auto_blend * 0.75
+            self._auto_blend_prog['blend_alpha'].value = self._auto_blend * AUTO_BLEND_MAX
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
             self._auto_blend_vao.render(moderngl.TRIANGLE_STRIP)
