@@ -193,6 +193,17 @@ def _load_settings(bank: int, slot: int) -> dict:
 
 
 def _save_settings(bank: int, slot: int) -> None:
+    """
+    Persist the current slot configuration (active effects, auto-effect pool, per-effect parameters, and beat threshold) to the slot's settings.json.
+    
+    Writes a JSON object containing:
+    - "effects": list of up to two active effects with keys `shader`, `intensity`, `param_a`, `param_b`, `param_c`.
+    - "auto_effects": list of auto-pool effects with the same per-effect keys.
+    - Legacy top-level keys (`shader`, `intensity`, `param_a`, `param_b`, `param_c`) populated from the first active effect for backward compatibility.
+    - "beat_thresh": the current slot beat threshold.
+    
+    Ensures the slot directory exists, writes the file, and prints the saved path and a summary of the saved active effect names.
+    """
     effects = [
         {
             'shader':    SHADERS[idx][0],
@@ -234,6 +245,27 @@ def _save_settings(bank: int, slot: int) -> None:
 
 
 def _apply_settings(cfg: dict) -> None:
+    """
+    Apply slot settings from a configuration dictionary to the application's global state.
+    
+    Updates global slot-wide parameters and effect selections based on either the new multi-effect format
+    (`cfg["effects"]`) or the legacy single-effect format (`cfg["shader"]`), and restores the set of
+    probabilistic auto-effects.
+    
+    Parameters:
+        cfg (dict): Loaded slot configuration. Recognized keys:
+            - "beat_thresh": numeric threshold for beat detection (updates global beat threshold).
+            - "effects": optional list of up to two effect objects in the new format; each object should
+              contain "shader" (name) and optional "intensity", "param_a", "param_b", "param_c".
+            - "shader", "intensity", "param_a", "param_b", "param_c": legacy single-effect keys.
+            - "auto_effects": optional list of effect objects (same shape as items in "effects") used
+              to populate the probabilistic auto-effect pool.
+    
+    Side effects:
+        - Mutates globals: `_slot_beat_thresh`, `_active_effects`, `_auto_effects`, and `_effect_params`.
+        - Normalizes shader names to indices by matching against the `SHADERS` list; unknown names fall
+          back to a default index.
+    """
     global _active_effects, _slot_beat_thresh, _auto_effects
     _slot_beat_thresh = cfg.get('beat_thresh', _DEFAULT_SETTINGS['beat_thresh'])
 
@@ -277,6 +309,16 @@ def _apply_settings(cfg: dict) -> None:
 
 
 def _select_slot(bank: int, slot: int, flash_osd: bool = False) -> None:
+    """
+    Select the given bank and slot, apply its settings, and request the slot's video for playback.
+    
+    Updates global selection state (_current_bank, _current_slot), loads and applies the slot's settings, sets _requested_video to the located video file (if any), prints slot and active-effect information, optionally triggers an on-screen display flash for the bank, and refreshes MIDI LEDs for the selected slot and current effects when a MIDI output is available.
+    
+    Parameters:
+        bank (int): 1-based bank index to select.
+        slot (int): 1-based slot index within the bank to select.
+        flash_osd (bool): If True, set the OSD trigger to the bank-specific color.
+    """
     global _current_bank, _current_slot, _requested_video, _osd_trigger
     _current_bank = bank
     _current_slot = slot
@@ -304,13 +346,28 @@ def _set_led(note: int, on: bool) -> None:
 
 
 def _slot_leds(active: int) -> None:
+    """
+    Set the RecARM strip LEDs so only the given strip number is illuminated.
+    
+    Parameters:
+        active (int): 1-based strip index to light; if no strip matches this index, all strip LEDs are turned off.
+    """
     for i, note in enumerate(RECARM):
         _set_led(note, (i + 1) == active)
 
 
 def _effect_leds(active_indices, slow_phase: bool = True, fast_phase: bool = True,
                  preview_idx: int | None = None) -> None:
-    page_start = _effect_page * 8
+    """
+                 Update the 8 MUTE-pad LEDs for the current effect page based on active effects, auto-effect pool, and preview state.
+                 
+                 Parameters:
+                 	active_indices (iterable of int): Shader indices that are currently active; LEDs for these indices are set solid on.
+                 	slow_phase (bool): Current slow blink phase used for auto-effect pool LEDs; `True` means the LED should be on for this phase.
+                 	fast_phase (bool): Current fast blink phase used for preview LED flashing; `True` means the LED should be on for this phase.
+                 	preview_idx (int | None): If set, enables solo-preview mode for the given shader index; in preview mode only the previewed LED uses `fast_phase` and all others are off.
+                 """
+                 page_start = _effect_page * 8
     for i in range(8):
         idx = page_start + i
         if idx >= len(SHADERS):
@@ -327,6 +384,11 @@ def _effect_leds(active_indices, slow_phase: bool = True, fast_phase: bool = Tru
 
 
 def _toggle_effect_page() -> None:
+    """
+    Cycle to the next effect page (wraps to the first page after the last), trigger an OSD flash, and refresh MIDI effect LEDs.
+    
+    This updates the global effect page index (computed from the number of shaders with 8 shaders per page), sets the OSD trigger color for a brief on-screen display, prints the new page to stdout, and, if a MIDI output is available, updates the effect LEDs to reflect the current active/auto/preview state.
+    """
     global _effect_page, _osd_trigger
     pages = max(1, (len(SHADERS) + 7) // 8)
     _effect_page = (_effect_page + 1) % pages
@@ -338,6 +400,18 @@ def _toggle_effect_page() -> None:
 
 # ── MIDI ──────────────────────────────────────────────────────────────────────
 def _handle_midi(msg) -> None:
+    """
+    Handle an incoming MIDI message and update application state (slot selection, effect activation/auto-pool membership, effect parameters, bank/page navigation, and master level).
+    
+    Parameters:
+        msg (mido.Message): MIDI message from the controller. Supported message types:
+            - note_on / note_off: selects slots, toggles effects, toggles per-effect auto mode on double-click, and tracks long-press preview/reset hold state.
+            - control_change: adjusts per-effect intensity and parameters for the current effect page, detects the "send all" CC burst to save slot settings, and updates the global master level.
+    
+    Side effects:
+        - May call _select_slot, _toggle_effect_page, _save_settings, and _effect_leds.
+        - Mutates globals including _active_effects, _auto_effects, _effect_params, _m_master, and internal timing/hold-tracking structures.
+    """
     global _m_master, _cc_burst_count, _cc_burst_time, _reset_held, _active_effects
 
     if msg.type in ('note_on', 'note_off'):
@@ -602,6 +676,18 @@ class VGLRApp(mglw.WindowConfig):
     resizable = False
 
     def __init__(self, **kwargs):
+        """
+        Initialize the VGLRApp window: compile shaders, create textures/FBOs, initialize render/audio/midi state, and start background threads and audio input.
+        
+        Sets up:
+        - VBO and main video texture bound to texture unit 0.
+        - Precompiled effect shader programs (normal and flipped variants) and a passthrough program.
+        - OSD and auto-blend programs and their VAOs.
+        - Two framebuffers/textures: one for two-effect chaining and one for auto-accent rendering.
+        - Timing, beat/flip, auto-accent, LED blink, and solo-preview state variables.
+        
+        Also starts the decoder and MIDI threads and opens the audio input stream with the configured callback.
+        """
         super().__init__(**kwargs)
         self._vbo = self.ctx.buffer(QUAD)
 
@@ -710,6 +796,33 @@ class VGLRApp(mglw.WindowConfig):
         _set_uniform(prog, 'stereo_width', float(sw))
 
     def on_render(self, time, frametime):
+        """
+        Perform a single render-frame update: process input state, update audio/momentum models, handle MIDI/LED/OSD logic, and draw the composed video+effects to the screen.
+        
+        This method is invoked once per frame and drives the entire per-frame pipeline:
+        - Polls the MIDI reset combo and exits the process if triggered.
+        - Applies any newly detected video framerate and OSD triggers.
+        - Samples and smooths audio bands and energy, logs periodic diagnostics, and computes scaled band/beat values for shaders.
+        - Uploads the next decoded video frame to the GPU when due.
+        - Detects beat onsets to trigger occasional screen flips.
+        - Updates momentum and probabilistically manages the probabilistic auto-effect accent (activation, deactivation, drift) and smoothly ramps its blend value.
+        - Detects long-press solo-preview of individual effects and triggers a preview render/OSD flash.
+        - Advances LED blink phasing and updates effect/preview/auto LEDs when a MIDI output is present.
+        - Chooses rendering paths:
+          - Solo-preview overrides normal rendering and renders the preview effect directly.
+          - No active effects: passthrough video.
+          - One active effect: render that effect to screen.
+          - Two active effects: render effect A into an FBO (flipped), then render effect B sampling that FBO.
+        - When applicable and not in preview, renders the current auto-effect into a secondary FBO and blends it over the final screen using an alpha blend.
+        - Renders the OSD flash overlay while blending is enabled.
+        
+        Parameters:
+            time (float): Global application time in seconds.
+            frametime (float): Time elapsed since the previous frame in seconds.
+        
+        Returns:
+            None
+        """
         global _new_fps, _osd_trigger
 
         # ── MIDI reset combo poll ─────────────────────────────────────────────
