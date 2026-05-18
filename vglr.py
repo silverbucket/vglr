@@ -29,7 +29,44 @@ GAIN         = 200.0  # higher = more sensitive; tune per venue
 SMOOTH       = 0.3
 BEAT_DECAY   = 0.85
 
-FALLBACK_VIDEO = 'videos/fb_rev_wet_mop_reimagined.mp4'
+FALLBACK_VIDEO = 'videos/bank1/video1/Americana.mp4'
+
+# ── auto-effect tuning ────────────────────────────────────────────────────────
+# How quickly the momentum tracker responds to energy changes.
+# Higher = smoother/slower; lower = snappier but jittery. Range 0–1.
+AUTO_MOMENTUM_SMOOTH   = 0.85
+
+# Scales how much energy swing is needed to shift momentum from 0 to 1.
+# Lower = small swings move the needle; higher = only big drops/builds matter.
+AUTO_MOMENTUM_SCALE    = 25.0
+
+# Beat amplitude threshold (pre-master) that triggers auto probability rolls.
+# 0.5 = medium beats; lower = reacts to quieter beats too.
+AUTO_BEAT_THRESHOLD    = 0.5
+
+# Minimum activate probability per beat (even at silence / flat energy).
+AUTO_P_ON_FLOOR        = 0.05
+# How much building momentum adds to activate probability. Total max = FLOOR + this.
+AUTO_P_ON_MOMENTUM     = 0.10
+
+# Minimum deactivate probability per beat (even while energy is building).
+AUTO_P_OFF_FLOOR       = 0.05
+# How much falling momentum adds to deactivate probability. Total max = FLOOR + this.
+AUTO_P_OFF_MOMENTUM    = 0.40
+
+# Probability per beat of drifting to a different effect within the auto pool.
+# Only applies when the pool has more than one effect.
+AUTO_P_DRIFT           = 0.15
+
+# Blend transition speed: higher = snappier fade in/out (2.5 ≈ 0.4s to full).
+AUTO_BLEND_RATE        = 2.5
+
+# Maximum opacity of the accent layer (0.0–1.0).
+# At 1.0 the auto effect fully covers the A/B output at peak blend.
+AUTO_BLEND_MAX         = 0.75
+
+# How long (seconds) to hold a MUTE button before solo-preview activates.
+PREVIEW_HOLD_S         = 1.0
 
 # ── shaders (name, path) — 8 slots map to 8 Mute buttons ─────────────────────
 SHADERS = [
@@ -120,6 +157,11 @@ _RESET_NOTES  = frozenset({MUTE[0], BANK_L, BANK_R})
 _RESET_HOLD_S = 2.0
 _reset_held: dict = {}   # note → press_time (MIDI thread only)
 
+# ── auto-effect probabilistic accent layer ────────────────────────────────────
+_auto_effects:   set  = set()   # effect indices in probabilistic mode
+_dbl_click_time: dict = {}      # MUTE note → last press time (double-click detection)
+_mute_hold_time: dict = {}      # MUTE note → press time (solo-preview hold detection)
+
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
 
@@ -151,6 +193,17 @@ def _load_settings(bank: int, slot: int) -> dict:
 
 
 def _save_settings(bank: int, slot: int) -> None:
+    """
+    Persist the current slot configuration (active effects, auto-effect pool, per-effect parameters, and beat threshold) to the slot's settings.json.
+    
+    Writes a JSON object containing:
+    - "effects": list of up to two active effects with keys `shader`, `intensity`, `param_a`, `param_b`, `param_c`.
+    - "auto_effects": list of auto-pool effects with the same per-effect keys.
+    - Legacy top-level keys (`shader`, `intensity`, `param_a`, `param_b`, `param_c`) populated from the first active effect for backward compatibility.
+    - "beat_thresh": the current slot beat threshold.
+    
+    Ensures the slot directory exists, writes the file, and prints the saved path and a summary of the saved active effect names.
+    """
     effects = [
         {
             'shader':    SHADERS[idx][0],
@@ -162,8 +215,20 @@ def _save_settings(bank: int, slot: int) -> None:
         for idx in sorted(_active_effects)
     ]
     first = effects[0] if effects else {}
+    auto = [
+        {
+            'shader':    SHADERS[idx][0],
+            'intensity': _effect_params[idx]['intensity'],
+            'param_a':   _effect_params[idx]['param_a'],
+            'param_b':   _effect_params[idx]['param_b'],
+            'param_c':   _effect_params[idx]['param_c'],
+        }
+        for idx in sorted(_auto_effects)
+        if idx < len(SHADERS)
+    ]
     cfg = {
-        'effects':     effects,
+        'effects':      effects,
+        'auto_effects': auto,
         # Legacy top-level keys for forward/backward compat with old format
         'shader':      first.get('shader', 'vhs'),
         'intensity':   first.get('intensity', 1.0),
@@ -180,7 +245,28 @@ def _save_settings(bank: int, slot: int) -> None:
 
 
 def _apply_settings(cfg: dict) -> None:
-    global _active_effects, _slot_beat_thresh
+    """
+    Apply slot settings from a configuration dictionary to the application's global state.
+    
+    Updates global slot-wide parameters and effect selections based on either the new multi-effect format
+    (`cfg["effects"]`) or the legacy single-effect format (`cfg["shader"]`), and restores the set of
+    probabilistic auto-effects.
+    
+    Parameters:
+        cfg (dict): Loaded slot configuration. Recognized keys:
+            - "beat_thresh": numeric threshold for beat detection (updates global beat threshold).
+            - "effects": optional list of up to two effect objects in the new format; each object should
+              contain "shader" (name) and optional "intensity", "param_a", "param_b", "param_c".
+            - "shader", "intensity", "param_a", "param_b", "param_c": legacy single-effect keys.
+            - "auto_effects": optional list of effect objects (same shape as items in "effects") used
+              to populate the probabilistic auto-effect pool.
+    
+    Side effects:
+        - Mutates globals: `_slot_beat_thresh`, `_active_effects`, `_auto_effects`, and `_effect_params`.
+        - Normalizes shader names to indices by matching against the `SHADERS` list; unknown names fall
+          back to a default index.
+    """
+    global _active_effects, _slot_beat_thresh, _auto_effects
     _slot_beat_thresh = cfg.get('beat_thresh', _DEFAULT_SETTINGS['beat_thresh'])
 
     raw_effects = cfg.get('effects')
@@ -208,8 +294,31 @@ def _apply_settings(cfg: dict) -> None:
         })
         _active_effects = [idx]
 
+    # Restore auto-effect pool
+    _auto_effects.clear()
+    for e in cfg.get('auto_effects', []):
+        idx = next((i for i, (n, _) in enumerate(SHADERS) if n == e.get('shader')), None)
+        if idx is not None:
+            _effect_params[idx].update({
+                'intensity': e.get('intensity', _DEFAULT_EFFECT['intensity']),
+                'param_a':   e.get('param_a',   _DEFAULT_EFFECT['param_a']),
+                'param_b':   e.get('param_b',   _DEFAULT_EFFECT['param_b']),
+                'param_c':   e.get('param_c',   _DEFAULT_EFFECT['param_c']),
+            })
+            _auto_effects.add(idx)
+
 
 def _select_slot(bank: int, slot: int, flash_osd: bool = False) -> None:
+    """
+    Select the given bank and slot, apply its settings, and request the slot's video for playback.
+    
+    Updates global selection state (_current_bank, _current_slot), loads and applies the slot's settings, sets _requested_video to the located video file (if any), prints slot and active-effect information, optionally triggers an on-screen display flash for the bank, and refreshes MIDI LEDs for the selected slot and current effects when a MIDI output is available.
+    
+    Parameters:
+        bank (int): 1-based bank index to select.
+        slot (int): 1-based slot index within the bank to select.
+        flash_osd (bool): If True, set the OSD trigger to the bank-specific color.
+    """
     global _current_bank, _current_slot, _requested_video, _osd_trigger
     _current_bank = bank
     _current_slot = slot
@@ -237,18 +346,49 @@ def _set_led(note: int, on: bool) -> None:
 
 
 def _slot_leds(active: int) -> None:
+    """
+    Set the RecARM strip LEDs so only the given strip number is illuminated.
+    
+    Parameters:
+        active (int): 1-based strip index to light; if no strip matches this index, all strip LEDs are turned off.
+    """
     for i, note in enumerate(RECARM):
         _set_led(note, (i + 1) == active)
 
 
-def _effect_leds(active_indices) -> None:
-    page_start = _effect_page * 8
+def _effect_leds(active_indices, slow_phase: bool = True, fast_phase: bool = True,
+                 preview_idx: int | None = None) -> None:
+    """
+                 Update the 8 MUTE-pad LEDs for the current effect page based on active effects, auto-effect pool, and preview state.
+                 
+                 Parameters:
+                 	active_indices (iterable of int): Shader indices that are currently active; LEDs for these indices are set solid on.
+                 	slow_phase (bool): Current slow blink phase used for auto-effect pool LEDs; `True` means the LED should be on for this phase.
+                 	fast_phase (bool): Current fast blink phase used for preview LED flashing; `True` means the LED should be on for this phase.
+                 	preview_idx (int | None): If set, enables solo-preview mode for the given shader index; in preview mode only the previewed LED uses `fast_phase` and all others are off.
+                 """
+                 page_start = _effect_page * 8
     for i in range(8):
         idx = page_start + i
-        _set_led(MUTE[i], idx in active_indices and idx < len(SHADERS))
+        if idx >= len(SHADERS):
+            _set_led(MUTE[i], False)
+        elif preview_idx is not None:
+            # Preview active: only the previewed LED fast-flashes; everything else off
+            _set_led(MUTE[i], fast_phase if idx == preview_idx else False)
+        elif idx in active_indices:
+            _set_led(MUTE[i], True)              # stable active: solid
+        elif idx in _auto_effects:
+            _set_led(MUTE[i], slow_phase)        # auto/trigger pool: slow blink
+        else:
+            _set_led(MUTE[i], False)
 
 
 def _toggle_effect_page() -> None:
+    """
+    Cycle to the next effect page (wraps to the first page after the last), trigger an OSD flash, and refresh MIDI effect LEDs.
+    
+    This updates the global effect page index (computed from the number of shaders with 8 shaders per page), sets the OSD trigger color for a brief on-screen display, prints the new page to stdout, and, if a MIDI output is available, updates the effect LEDs to reflect the current active/auto/preview state.
+    """
     global _effect_page, _osd_trigger
     pages = max(1, (len(SHADERS) + 7) // 8)
     _effect_page = (_effect_page + 1) % pages
@@ -260,7 +400,19 @@ def _toggle_effect_page() -> None:
 
 # ── MIDI ──────────────────────────────────────────────────────────────────────
 def _handle_midi(msg) -> None:
-    global _m_master, _cc_burst_count, _cc_burst_time, _reset_held
+    """
+    Handle an incoming MIDI message and update application state (slot selection, effect activation/auto-pool membership, effect parameters, bank/page navigation, and master level).
+    
+    Parameters:
+        msg (mido.Message): MIDI message from the controller. Supported message types:
+            - note_on / note_off: selects slots, toggles effects, toggles per-effect auto mode on double-click, and tracks long-press preview/reset hold state.
+            - control_change: adjusts per-effect intensity and parameters for the current effect page, detects the "send all" CC burst to save slot settings, and updates the global master level.
+    
+    Side effects:
+        - May call _select_slot, _toggle_effect_page, _save_settings, and _effect_leds.
+        - Mutates globals including _active_effects, _auto_effects, _effect_params, _m_master, and internal timing/hold-tracking structures.
+    """
+    global _m_master, _cc_burst_count, _cc_burst_time, _reset_held, _active_effects
 
     if msg.type in ('note_on', 'note_off'):
         pressed = msg.type == 'note_on' and msg.velocity > 0
@@ -273,6 +425,14 @@ def _handle_midi(msg) -> None:
             else:
                 _reset_held.pop(note, None)
         # ── end reset combo ───────────────────────────────────────────────────
+
+        # ── solo-preview hold tracking ────────────────────────────────────────
+        if note in MUTE:
+            if pressed:
+                _mute_hold_time[note] = time.monotonic()
+            else:
+                _mute_hold_time.pop(note, None)
+        # ─────────────────────────────────────────────────────────────────────
 
         if not pressed:
             return
@@ -288,6 +448,23 @@ def _handle_midi(msg) -> None:
                 real_idx = _effect_page * 8 + i
                 if real_idx >= len(SHADERS):
                     return
+                now_t = time.monotonic()
+                last_t = _dbl_click_time.get(n, 0.0)
+                _dbl_click_time[n] = now_t
+
+                if now_t - last_t < 0.35:
+                    # Double-click: toggle auto mode
+                    _dbl_click_time[n] = 0.0   # reset so triple-click is a fresh single
+                    if real_idx in _auto_effects:
+                        _auto_effects.discard(real_idx)
+                    else:
+                        _active_effects = [e for e in _active_effects if e != real_idx]
+                        _auto_effects.add(real_idx)
+                    _effect_leds(_active_effects)
+                    return
+
+                # Single click: stable toggle (also exits auto mode if already there)
+                _auto_effects.discard(real_idx)
                 if real_idx in _active_effects:
                     _active_effects.remove(real_idx)
                 elif len(_active_effects) < 2:
@@ -463,6 +640,17 @@ void main() {
 }
 """
 
+_AUTO_BLEND_FRAG = """
+#version 140
+uniform sampler2D overlay;
+uniform float blend_alpha;
+in vec2 uv;
+out vec4 fragColor;
+void main() {
+    fragColor = vec4(texture(overlay, uv).rgb, blend_alpha);
+}
+"""
+
 _PASSTHROUGH_FRAG = """
 #version 140
 uniform sampler2D video;
@@ -488,6 +676,18 @@ class VGLRApp(mglw.WindowConfig):
     resizable = False
 
     def __init__(self, **kwargs):
+        """
+        Initialize the VGLRApp window: compile shaders, create textures/FBOs, initialize render/audio/midi state, and start background threads and audio input.
+        
+        Sets up:
+        - VBO and main video texture bound to texture unit 0.
+        - Precompiled effect shader programs (normal and flipped variants) and a passthrough program.
+        - OSD and auto-blend programs and their VAOs.
+        - Two framebuffers/textures: one for two-effect chaining and one for auto-accent rendering.
+        - Timing, beat/flip, auto-accent, LED blink, and solo-preview state variables.
+        
+        Also starts the decoder and MIDI threads and opens the audio input stream with the configured callback.
+        """
         super().__init__(**kwargs)
         self._vbo = self.ctx.buffer(QUAD)
 
@@ -534,6 +734,15 @@ class VGLRApp(mglw.WindowConfig):
         self._fbo_tex = self.ctx.texture(self.wnd.size, 4)
         self._fbo     = self.ctx.framebuffer(color_attachments=[self._fbo_tex])
 
+        # FBO2 for auto-effect accent layer: rendered on original video, blended over screen
+        self._fbo2_tex = self.ctx.texture(self.wnd.size, 4)
+        self._fbo2     = self.ctx.framebuffer(color_attachments=[self._fbo2_tex])
+        self._auto_blend_prog = self.ctx.program(
+            vertex_shader=VERT, fragment_shader=_AUTO_BLEND_FRAG)
+        self._auto_blend_vao  = self.ctx.vertex_array(
+            self._auto_blend_prog, [(self._vbo, '2f', 'in_position')])
+        self._auto_blend_prog['overlay'] = 1   # texture unit 1
+
         global _new_fps
         _new_fps = None
 
@@ -546,6 +755,23 @@ class VGLRApp(mglw.WindowConfig):
         self._flip_active     = False  # True while beat-triggered flip is on
         self._flip_timer      = 0.0   # counts down; flip holds until this hits 0
         self._prev_beat_high  = False  # rising-edge detection for beat onset
+
+        # Auto-effect accent layer state
+        self._auto_current      = None   # effect index currently in accent slot (or None)
+        self._auto_blend        = 0.0    # current mix factor (smoothly ramped)
+        self._auto_blend_target = 0.0    # 1.0 when accent active, 0.0 when not
+        self._auto_beat_prev    = False  # beat edge detection
+        self._prev_se           = 0.0    # previous smooth_energy for momentum
+        self._momentum          = 0.0    # smoothed dE/dt
+
+        # LED blink state (driven from render loop so auto/preview LEDs can flash)
+        # Tick at 8 Hz; slow_phase toggles at 1 Hz, fast_phase at 4 Hz.
+        self._led_tick  = 0.0
+        self._led_count = 0
+
+        # Solo-preview state
+        self._preview_idx     = None   # effect currently being previewed (or None)
+        self._preview_entered = False  # True on the first frame of preview (triggers OSD)
 
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
@@ -570,6 +796,33 @@ class VGLRApp(mglw.WindowConfig):
         _set_uniform(prog, 'stereo_width', float(sw))
 
     def on_render(self, time, frametime):
+        """
+        Perform a single render-frame update: process input state, update audio/momentum models, handle MIDI/LED/OSD logic, and draw the composed video+effects to the screen.
+        
+        This method is invoked once per frame and drives the entire per-frame pipeline:
+        - Polls the MIDI reset combo and exits the process if triggered.
+        - Applies any newly detected video framerate and OSD triggers.
+        - Samples and smooths audio bands and energy, logs periodic diagnostics, and computes scaled band/beat values for shaders.
+        - Uploads the next decoded video frame to the GPU when due.
+        - Detects beat onsets to trigger occasional screen flips.
+        - Updates momentum and probabilistically manages the probabilistic auto-effect accent (activation, deactivation, drift) and smoothly ramps its blend value.
+        - Detects long-press solo-preview of individual effects and triggers a preview render/OSD flash.
+        - Advances LED blink phasing and updates effect/preview/auto LEDs when a MIDI output is present.
+        - Chooses rendering paths:
+          - Solo-preview overrides normal rendering and renders the preview effect directly.
+          - No active effects: passthrough video.
+          - One active effect: render that effect to screen.
+          - Two active effects: render effect A into an FBO (flipped), then render effect B sampling that FBO.
+        - When applicable and not in preview, renders the current auto-effect into a secondary FBO and blends it over the final screen using an alpha blend.
+        - Renders the OSD flash overlay while blending is enabled.
+        
+        Parameters:
+            time (float): Global application time in seconds.
+            frametime (float): Time elapsed since the previous frame in seconds.
+        
+        Returns:
+            None
+        """
         global _new_fps, _osd_trigger
 
         # ── MIDI reset combo poll ─────────────────────────────────────────────
@@ -648,12 +901,93 @@ class VGLRApp(mglw.WindowConfig):
         self._flip_timer  = max(0.0, self._flip_timer - frametime)
         self._flip_active = self._flip_timer > 0.0
 
+        # ── auto-effect probability logic ─────────────────────────────────────
+        # Momentum: smoothed derivative of smooth_energy (positive = building)
+        delta = self._smooth_energy - self._prev_se
+        self._momentum = self._momentum * AUTO_MOMENTUM_SMOOTH + delta * (1.0 - AUTO_MOMENTUM_SMOOTH)
+        self._prev_se  = self._smooth_energy
+        # Normalise momentum to 0..1: 0 = falling, 0.5 = flat, 1 = building fast
+        momentum_norm = min(max(self._momentum * AUTO_MOMENTUM_SCALE + 0.5, 0.0), 1.0)
+
+        auto_beat = float(bt) > AUTO_BEAT_THRESHOLD
+        if auto_beat and not self._auto_beat_prev and _auto_effects:
+            if self._auto_current is None:
+                # Chance to activate scales with momentum (building energy → more likely)
+                p_on = AUTO_P_ON_FLOOR + momentum_norm * AUTO_P_ON_MOMENTUM
+                if random.random() < p_on:
+                    self._auto_current      = random.choice(list(_auto_effects))
+                    self._auto_blend_target = 1.0
+            else:
+                # Chance to deactivate scales with falling energy
+                p_off = AUTO_P_OFF_FLOOR + (1.0 - momentum_norm) * AUTO_P_OFF_MOMENTUM
+                if random.random() < p_off:
+                    self._auto_current      = None
+                    self._auto_blend_target = 0.0
+                elif len(_auto_effects) > 1 and random.random() < AUTO_P_DRIFT:
+                    # Occasionally drift to a different effect in the pool
+                    candidates = [e for e in _auto_effects if e != self._auto_current]
+                    self._auto_current = random.choice(candidates)
+        self._auto_beat_prev = auto_beat
+
+        # If pool was cleared externally (slot change), retire active auto effect
+        if self._auto_current is not None and self._auto_current not in _auto_effects:
+            self._auto_current      = None
+            self._auto_blend_target = 0.0
+
+        # Smooth blend ramp
+        if self._auto_blend < self._auto_blend_target:
+            self._auto_blend = min(self._auto_blend_target,
+                                   self._auto_blend + AUTO_BLEND_RATE * frametime)
+        else:
+            self._auto_blend = max(self._auto_blend_target,
+                                   self._auto_blend - AUTO_BLEND_RATE * frametime)
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── solo-preview detection ────────────────────────────────────────────
+        prev_preview = self._preview_idx
+        self._preview_idx = None
+        now_p = _monotonic()
+        for i, n in enumerate(MUTE):
+            press_t = _mute_hold_time.get(n)
+            if press_t and now_p - press_t >= PREVIEW_HOLD_S:
+                self._preview_idx = _effect_page * 8 + i
+                break
+        if self._preview_idx is not None and prev_preview is None:
+            self._preview_entered = True   # first frame: trigger OSD flash
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── LED blink tick (8 Hz; slow=1 Hz, fast=4 Hz) ──────────────────────
+        self._led_tick += frametime
+        if self._led_tick >= 0.125:   # 8 Hz
+            self._led_tick  -= 0.125
+            self._led_count += 1
+            slow_phase = bool(self._led_count % 8 < 4)   # on 4 ticks, off 4 → 1 Hz
+            fast_phase = bool(self._led_count % 2 == 0)  # on 1 tick,  off 1 → 4 Hz
+            if (_auto_effects or self._preview_idx is not None) and _midi_out:
+                _effect_leds(_active_effects, slow_phase=slow_phase,
+                             fast_phase=fast_phase, preview_idx=self._preview_idx)
+        # ─────────────────────────────────────────────────────────────────────
+
         # For single-effect or final-screen render: choose normal or flip progs.
         screen_progs = self._progs_flip if self._flip_active else self._progs
 
         effects = list(_active_effects)   # stable snapshot for this frame
 
-        if not effects:
+        # ── solo-preview render override ──────────────────────────────────────
+        if self._preview_idx is not None and self._preview_idx in self._progs:
+            if self._preview_entered:
+                _osd_trigger = (1.0, 0.55, 0.0)   # orange flash on entry
+                self._preview_entered = False
+            prog, vao = self._progs[self._preview_idx]
+            params = _effect_params[self._preview_idx]
+            self.ctx.screen.use()
+            self.ctx.clear()
+            self.texture.use(location=0)
+            self._set_effect_uniforms(prog, time, params['intensity'] * energy_scaled,
+                                      params, bass, mid, treble, beat, sw)
+            vao.render(moderngl.TRIANGLE_STRIP)
+            # Skip normal render + auto accent; jump straight to OSD
+        elif not effects:
             # No effects active: show raw video
             self.ctx.screen.use()
             self.ctx.clear()
@@ -704,6 +1038,30 @@ class VGLRApp(mglw.WindowConfig):
 
                 # Restore video texture binding for next frame upload
                 self.texture.use(location=0)
+
+        # ── auto-effect accent blend (skipped during solo preview) ───────────
+        # Render auto effect on original video into FBO2, then blend over screen.
+        # Uses _progs_flip for correct orientation (same double-flip logic as pass 1).
+        if self._preview_idx is None and self._auto_blend > 0.001 and self._auto_current in self._progs_flip:
+            prog_auto, vao_auto = self._progs_flip[self._auto_current]
+            params_auto = _effect_params[self._auto_current]
+            self._fbo2.use()
+            self._fbo2.clear()
+            self._set_effect_uniforms(
+                prog_auto, time, params_auto['intensity'] * energy_scaled,
+                params_auto, bass, mid, treble, beat, sw)
+            self.texture.use(location=0)   # original video
+            vao_auto.render(moderngl.TRIANGLE_STRIP)
+
+            self.ctx.screen.use()
+            self._fbo2_tex.use(location=1)
+            self._auto_blend_prog['blend_alpha'].value = self._auto_blend * AUTO_BLEND_MAX
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self._auto_blend_vao.render(moderngl.TRIANGLE_STRIP)
+            self.ctx.disable(moderngl.BLEND)
+            self.texture.use(location=0)   # restore
+        # ─────────────────────────────────────────────────────────────────────
 
         # OSD bank/page flash
         if self._osd_timer > 0:
