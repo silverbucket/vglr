@@ -59,7 +59,8 @@ MUTE      = [1,  4,  7,  10, 13, 16, 19, 22]   # Mute notes, strips 1-8
 SOLO      = 27
 BANK_L    = 25
 BANK_R    = 26
-SEND_ALL_BURST  = 32    # SEND ALL fires all 33 CCs; save after 32
+# SEND ALL emits one CC for every knob, channel fader, and the master (33 unique).
+# A raw message count false-triggers on a single fader (same CC repeated).
 SEND_ALL_WINDOW = 0.15  # seconds; CC burst window
 FADER_CC  = [19, 23, 27, 31, 49, 53, 57, 61]
 KNOB_CC   = [
@@ -112,8 +113,11 @@ _osd_trigger     = None
 _effect_page     = 0
 
 # ── SEND ALL burst detection (MIDI thread only) ───────────────────────────────
-_cc_burst_count = 0
-_cc_burst_time  = 0.0
+_SEND_ALL_CCS = frozenset(
+    cc for row in KNOB_CC for cc in row
+) | frozenset(FADER_CC) | frozenset((MASTER_CC,))
+_cc_burst_seen: set = set()
+_cc_burst_time = 0.0
 
 # ── MIDI reset combo: hold MUTE-1 + BANK_L + BANK_R for 2 s ──────────────────
 _RESET_NOTES  = frozenset({MUTE[0], BANK_L, BANK_R})
@@ -172,22 +176,31 @@ def _save_settings(bank: int, slot: int) -> None:
         'param_c':     first.get('param_c', 0.4),
         'beat_thresh': _slot_beat_thresh,
     }
+    # Atomic replace so a crash mid-write cannot leave truncated JSON.
+    # _load_settings turns corrupt JSON into defaults and the preset is gone.
+    path = _settings_path(bank, slot)
     os.makedirs(_slot_dir(bank, slot), exist_ok=True)
-    with open(_settings_path(bank, slot), 'w') as f:
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
         json.dump(cfg, f, indent=2)
-    names = '+'.join(e['shader'] for e in effects)
-    print(f"saved: {_settings_path(bank, slot)}  ({names})")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    names = '+'.join(e['shader'] for e in effects) or 'none'
+    print(f"saved: {path}  ({names})")
 
 
 def _apply_settings(cfg: dict) -> None:
     global _active_effects, _slot_beat_thresh
     _slot_beat_thresh = cfg.get('beat_thresh', _DEFAULT_SETTINGS['beat_thresh'])
 
-    raw_effects = cfg.get('effects')
-    if raw_effects:
-        # New multi-effect format
+    # An empty list is a saved "no effects" look. Only a missing key is legacy.
+    raw_effects = cfg.get('effects', None)
+    if isinstance(raw_effects, list):
         new_active = []
         for e in raw_effects[:2]:
+            if not isinstance(e, dict):
+                continue
             idx = next((i for i, (n, _) in enumerate(SHADERS) if n == e.get('shader')), 0)
             _effect_params[idx].update({
                 'intensity': e.get('intensity', _DEFAULT_EFFECT['intensity']),
@@ -195,7 +208,8 @@ def _apply_settings(cfg: dict) -> None:
                 'param_b':   e.get('param_b',   _DEFAULT_EFFECT['param_b']),
                 'param_c':   e.get('param_c',   _DEFAULT_EFFECT['param_c']),
             })
-            new_active.append(idx)
+            if idx not in new_active:
+                new_active.append(idx)
         _active_effects = sorted(new_active)
     else:
         # Legacy single-effect format
@@ -259,8 +273,26 @@ def _toggle_effect_page() -> None:
 
 
 # ── MIDI ──────────────────────────────────────────────────────────────────────
+def _apply_cc(cc: int, v: int) -> None:
+    """Map one MIDI CC onto the current effect page or the master fader."""
+    global _m_master
+    for si in range(8):
+        effect_idx = _effect_page * 8 + si
+        if effect_idx >= len(SHADERS):
+            continue
+        if cc == FADER_CC[si]:
+            _effect_params[effect_idx]['intensity'] = v / 127.0
+            return
+        for k, key in enumerate(('param_a', 'param_b', 'param_c')):
+            if cc == KNOB_CC[si][k]:
+                _effect_params[effect_idx][key] = v / 127.0
+                return
+    if cc == MASTER_CC:
+        _m_master = v / 127.0
+
+
 def _handle_midi(msg) -> None:
-    global _m_master, _cc_burst_count, _cc_burst_time, _reset_held
+    global _cc_burst_time, _reset_held
 
     if msg.type in ('note_on', 'note_off'):
         pressed = msg.type == 'note_on' and msg.velocity > 0
@@ -307,31 +339,22 @@ def _handle_midi(msg) -> None:
     elif msg.type == 'control_change':
         cc, v = msg.control, msg.value
 
-        # Detect SEND ALL: 33 CCs arrive in < 150ms
+        # SEND ALL is a burst of every knob/fader CC. Apply this message first,
+        # then save only once every factory CC has been seen in the window.
+        # Saving on a raw count (and before apply) dropped the tail of the burst
+        # and also fired when one fader streamed ~32 repeats.
         now = time.monotonic()
         if now - _cc_burst_time > SEND_ALL_WINDOW:
-            _cc_burst_count = 0
-            _cc_burst_time  = now
-        _cc_burst_count += 1
-        if _cc_burst_count == SEND_ALL_BURST:
-            _save_settings(_current_bank, _current_slot)
-
-        # Each strip independently controls its own effect on the current page.
-        # This works whether or not that effect is currently active.
-        for si in range(8):
-            effect_idx = _effect_page * 8 + si
-            if effect_idx >= len(SHADERS):
-                continue
-            if cc == FADER_CC[si]:
-                _effect_params[effect_idx]['intensity'] = v / 127.0
-                return
-            for k, key in enumerate(('param_a', 'param_b', 'param_c')):
-                if cc == KNOB_CC[si][k]:
-                    _effect_params[effect_idx][key] = v / 127.0
-                    return
-
-        if cc == MASTER_CC:
-            _m_master = v / 127.0
+            _cc_burst_seen.clear()
+            _cc_burst_time = now
+        _cc_burst_seen.add(cc)
+        _apply_cc(cc, v)
+        if _SEND_ALL_CCS <= _cc_burst_seen:
+            _cc_burst_seen.clear()
+            try:
+                _save_settings(_current_bank, _current_slot)
+            except Exception as exc:
+                print(f"save error: {exc}", flush=True)
 
 
 def _midi_loop() -> None:
@@ -722,21 +745,38 @@ class VGLRApp(mglw.WindowConfig):
             self.wnd.close()
 
 
+def _probe_video(path: str):
+    """Return (width, height, fps) or raise if the file cannot drive the output."""
+    with av.open(path) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"no video stream in {path}")
+        stream = container.streams.video[0]
+        width = int(stream.width)
+        height = int(stream.height)
+        fps = float(stream.average_rate or stream.guessed_rate or 30)
+        if width <= 0 or height <= 0 or fps <= 0:
+            raise RuntimeError(f"unusable video geometry in {path}")
+        return width, height, fps
+
+
 # ── startup ───────────────────────────────────────────────────────────────────
 _select_slot(1, 1)
 if _requested_video is None and os.path.exists(FALLBACK_VIDEO):
     _requested_video = FALLBACK_VIDEO
     print(f"fallback: {FALLBACK_VIDEO}")
 
+# A bad file in the boot slot used to raise here, before the window or MIDI
+# thread existed, so systemd Restart=on-failure crash-looped and the show
+# could not switch to another slot. Keep going; the decode thread retries.
+_init_w, _init_h, _init_fps = 1920, 1080, 30.0
 if _requested_video:
-    with av.open(_requested_video) as _c:
-        _s = _c.streams.video[0]
-        _init_w   = _s.width
-        _init_h   = _s.height
-        _init_fps = float(_s.average_rate or _s.guessed_rate or 30)
-    print(f"video: {_init_w}x{_init_h} @ {_init_fps:.3f} fps")
+    try:
+        _init_w, _init_h, _init_fps = _probe_video(_requested_video)
+        print(f"video: {_init_w}x{_init_h} @ {_init_fps:.3f} fps")
+    except Exception as exc:
+        print(f"WARNING: could not probe {_requested_video}: {exc}", flush=True)
+        print("WARNING: starting anyway — switch slot if this file is bad", flush=True)
 else:
-    _init_w, _init_h, _init_fps = 1920, 1080, 30.0
     print("WARNING: no video found — add videos/bank1/video1/*.mp4")
 
 if __name__ == '__main__':
