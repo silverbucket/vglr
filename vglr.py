@@ -116,8 +116,7 @@ _effect_page     = 0
 _SEND_ALL_CCS = frozenset(
     cc for row in KNOB_CC for cc in row
 ) | frozenset(FADER_CC) | frozenset((MASTER_CC,))
-_cc_burst_seen: set = set()
-_cc_burst_time = 0.0
+_cc_seen_at: dict = {}   # cc -> last arrival time (sliding window)
 
 # ── MIDI reset combo: hold MUTE-1 + BANK_L + BANK_R for 2 s ──────────────────
 _RESET_NOTES  = frozenset({MUTE[0], BANK_L, BANK_R})
@@ -292,7 +291,7 @@ def _apply_cc(cc: int, v: int) -> None:
 
 
 def _handle_midi(msg) -> None:
-    global _cc_burst_time, _reset_held
+    global _reset_held
 
     if msg.type in ('note_on', 'note_off'):
         pressed = msg.type == 'note_on' and msg.velocity > 0
@@ -340,17 +339,14 @@ def _handle_midi(msg) -> None:
         cc, v = msg.control, msg.value
 
         # SEND ALL is a burst of every knob/fader CC. Apply this message first,
-        # then save only once every factory CC has been seen in the window.
-        # Saving on a raw count (and before apply) dropped the tail of the burst
-        # and also fired when one fader streamed ~32 repeats.
+        # then save once every factory CC arrived within the last window.
+        # Sliding (not fixed) so a knob touch or pot jitter just before the
+        # burst cannot expire the window mid-burst and skip the save.
         now = time.monotonic()
-        if now - _cc_burst_time > SEND_ALL_WINDOW:
-            _cc_burst_seen.clear()
-            _cc_burst_time = now
-        _cc_burst_seen.add(cc)
+        _cc_seen_at[cc] = now
         _apply_cc(cc, v)
-        if _SEND_ALL_CCS <= _cc_burst_seen:
-            _cc_burst_seen.clear()
+        if all(now - _cc_seen_at.get(c, float('-inf')) <= SEND_ALL_WINDOW for c in _SEND_ALL_CCS):
+            _cc_seen_at.clear()
             try:
                 _save_settings(_current_bank, _current_slot)
             except Exception as exc:
@@ -768,7 +764,9 @@ if _requested_video is None and os.path.exists(FALLBACK_VIDEO):
 # A bad file in the boot slot used to raise here, before the window or MIDI
 # thread existed, so systemd Restart=on-failure crash-looped and the show
 # could not switch to another slot. Keep going; the decode thread retries.
-_init_w, _init_h, _init_fps = 1920, 1080, 30.0
+# Texture size is fixed for the whole session and every clip is reformatted to
+# it, so the fallback matches the 720p output the Pi can actually sustain.
+_init_w, _init_h, _init_fps = 1280, 720, 30.0
 if _requested_video:
     try:
         _init_w, _init_h, _init_fps = _probe_video(_requested_video)

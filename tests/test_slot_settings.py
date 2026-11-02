@@ -40,8 +40,7 @@ class SlotSettingsTests(unittest.TestCase):
         vglr._current_slot = 1
         vglr._active_effects = [0]
         vglr._slot_beat_thresh = 1.8
-        vglr._cc_burst_seen.clear()
-        vglr._cc_burst_time = 0.0
+        vglr._cc_seen_at.clear()
         vglr._m_master = 1.0
         for params in vglr._effect_params.values():
             params.update(vglr._DEFAULT_EFFECT)
@@ -75,6 +74,22 @@ class SlotSettingsTests(unittest.TestCase):
         self.assertEqual(cfg["effects"][0]["shader"], "melt")
         self.assertEqual(cfg["effects"][0]["intensity"], 1.0)
         self.assertFalse(os.path.exists(path + ".tmp"))
+
+    def test_send_all_right_after_another_cc_still_saves(self):
+        # A knob touch or pot jitter just before SEND ALL used to open a fixed
+        # window that expired mid-burst, so the save was silently skipped.
+        clock = [100.0]
+        real = vglr.time.monotonic
+        vglr.time.monotonic = lambda: clock[0]
+        try:
+            _cc(vglr.FADER_CC[0], 5)
+            clock[0] += 0.14
+            for cc in sorted(vglr._SEND_ALL_CCS):
+                _cc(cc, 64)
+                clock[0] += 0.001
+        finally:
+            vglr.time.monotonic = real
+        self.assertEqual(self._settings()["effects"][0]["shader"], "vhs")
 
     def test_fader_stream_does_not_save(self):
         vglr._active_effects = [0]
