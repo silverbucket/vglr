@@ -121,7 +121,10 @@ _cc_seen_at: dict = {}   # cc -> last arrival time (sliding window)
 # ── MIDI reset combo: hold MUTE-1 + BANK_L + BANK_R for 2 s ──────────────────
 _RESET_NOTES  = frozenset({MUTE[0], BANK_L, BANK_R})
 _RESET_HOLD_S = 2.0
-_reset_held: dict = {}   # note → press_time (MIDI thread only)
+_RESET_STALE_S = 10.0
+_reset_held: dict = {}       # note → press_time; MIDI writes, render evicts
+_reset_combo_active = False  # True while two or more combo notes overlap
+_reset_solo_note = None      # combo key pressed alone; its action runs on release
 
 frame_queue: queue.Queue = queue.Queue(maxsize=4)
 
@@ -290,24 +293,83 @@ def _apply_cc(cc: int, v: int) -> None:
         _m_master = v / 127.0
 
 
+def _toggle_effect(real_idx: int) -> None:
+    """Toggle one shader in the active pair. A third effect is ignored."""
+    if real_idx < 0 or real_idx >= len(SHADERS):
+        return
+    if real_idx in _active_effects:
+        _active_effects.remove(real_idx)
+    elif len(_active_effects) < 2:
+        _active_effects.append(real_idx)
+        _active_effects.sort()
+    _effect_leds(_active_effects)
+
+
+def _dispatch_reset_note(note: int) -> None:
+    """Normal action for a combo key that was pressed and released alone."""
+    if note == MUTE[0]:
+        _toggle_effect(_effect_page * 8)
+    elif note == BANK_L:
+        _select_slot(max(1, _current_bank - 1), _current_slot, flash_osd=True)
+    elif note == BANK_R:
+        _select_slot(_current_bank + 1, _current_slot, flash_osd=True)
+
+
+def _poll_reset_combo() -> bool:
+    """True when MUTE-1 + BANK_L + BANK_R have been down together for 2 s.
+
+    Only drops presses older than 10 s. A previous snapshot must not be written
+    back: _monotonic() releases the GIL, and a note-off handled in that window
+    would be restored, so letting go of an aborted combo still os._exit'd the
+    player two seconds after the press.
+    """
+    global _reset_combo_active
+    now = _monotonic()
+    for note in list(_reset_held):
+        pressed_at = _reset_held.get(note)
+        if pressed_at is not None and now - pressed_at > _RESET_STALE_S:
+            if _reset_held.get(note) == pressed_at:
+                _reset_held.pop(note, None)
+    # A stuck chord whose note-offs never arrived must not swallow the next tap.
+    # A solo press keeps _reset_solo_note so its release still runs after this.
+    if not _reset_held:
+        _reset_combo_active = False
+    held = dict(_reset_held)
+    return (len(held) == 3
+            and _RESET_NOTES <= held.keys()
+            and now - max(held.values()) >= _RESET_HOLD_S)
+
+
 def _handle_midi(msg) -> None:
-    global _reset_held
+    global _reset_combo_active, _reset_solo_note
 
     if msg.type in ('note_on', 'note_off'):
         pressed = msg.type == 'note_on' and msg.velocity > 0
         note    = msg.note
 
-        # ── reset combo hold tracking (trigger polled in render loop) ───────────
+        # Combo keys fire on release, and only when no other combo key overlapped.
+        # Firing on press cut the projector to another bank and toggled an effect
+        # for the whole hold, and left that change in place if the operator let go.
         if note in _RESET_NOTES:
             if pressed:
-                _reset_held[note] = time.monotonic()
+                _reset_held[note] = _monotonic()
+                if len(_reset_held) >= 2:
+                    _reset_combo_active = True
+                    _reset_solo_note = None
+                elif not _reset_combo_active:
+                    _reset_solo_note = note
             else:
                 _reset_held.pop(note, None)
-        # ── end reset combo ───────────────────────────────────────────────────
+                if _reset_combo_active:
+                    if not _reset_held:
+                        _reset_combo_active = False
+                elif _reset_solo_note == note:
+                    _reset_solo_note = None
+                    _dispatch_reset_note(note)
+            return
 
         if not pressed:
             return
-        note = msg.note
 
         for i, n in enumerate(RECARM):
             if note == n:
@@ -316,23 +378,10 @@ def _handle_midi(msg) -> None:
 
         for i, n in enumerate(MUTE):
             if note == n:
-                real_idx = _effect_page * 8 + i
-                if real_idx >= len(SHADERS):
-                    return
-                if real_idx in _active_effects:
-                    _active_effects.remove(real_idx)
-                elif len(_active_effects) < 2:
-                    _active_effects.append(real_idx)
-                    _active_effects.sort()
-                # else: already at 2 active — ignore press
-                _effect_leds(_active_effects)
+                _toggle_effect(_effect_page * 8 + i)
                 return
 
-        if note == BANK_L:
-            _select_slot(max(1, _current_bank - 1), _current_slot, flash_osd=True)
-        elif note == BANK_R:
-            _select_slot(_current_bank + 1, _current_slot, flash_osd=True)
-        elif note == SOLO:
+        if note == SOLO:
             _toggle_effect_page()
 
     elif msg.type == 'control_change':
@@ -591,21 +640,11 @@ class VGLRApp(mglw.WindowConfig):
     def on_render(self, time, frametime):
         global _new_fps, _osd_trigger
 
-        # ── MIDI reset combo poll ─────────────────────────────────────────────
-        held = dict(_reset_held)
-        now  = _monotonic()
-        # Evict stale entries (pressed > 10 s ago without completing the combo)
-        _reset_held.update({k: v for k, v in held.items() if now - v <= 10.0})
-        for k in [k for k, v in held.items() if now - v > 10.0]:
-            _reset_held.pop(k, None)
-        if (len(held) == 3 and
-                all(k in held for k in _RESET_NOTES) and
-                now - max(held.values()) >= _RESET_HOLD_S):
+        if _poll_reset_combo():
             print("reset combo held — restarting", flush=True)
             for n in MUTE + RECARM:
                 _set_led(n, False)
             os._exit(1)
-        # ─────────────────────────────────────────────────────────────────────
 
         if _new_fps is not None:
             self.frame_interval = 1.0 / _new_fps
