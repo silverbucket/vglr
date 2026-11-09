@@ -30,6 +30,14 @@ def _cc(control, value):
     vglr._handle_midi(_Msg(type="control_change", control=control, value=value))
 
 
+def _note(note, pressed, velocity=127):
+    vglr._handle_midi(_Msg(
+        type="note_on" if pressed else "note_off",
+        note=note,
+        velocity=velocity if pressed else 0,
+    ))
+
+
 class SlotSettingsTests(unittest.TestCase):
     def setUp(self):
         self._old = os.getcwd()
@@ -42,6 +50,9 @@ class SlotSettingsTests(unittest.TestCase):
         vglr._slot_beat_thresh = 1.8
         vglr._cc_seen_at.clear()
         vglr._m_master = 1.0
+        vglr._reset_held.clear()
+        vglr._reset_combo_active = False
+        vglr._reset_solo_note = None
         for params in vglr._effect_params.values():
             params.update(vglr._DEFAULT_EFFECT)
 
@@ -164,6 +175,107 @@ class SlotSettingsTests(unittest.TestCase):
         self.assertEqual(vglr._active_effects, [7])
         self.assertEqual(vglr._effect_params[7]["intensity"], 0.25)
         self.assertEqual(vglr._effect_params[7]["param_a"], 0.1)
+
+
+class ResetComboTests(unittest.TestCase):
+    def setUp(self):
+        self._old_clock = vglr._monotonic
+        vglr._current_bank = 3
+        vglr._current_slot = 2
+        vglr._effect_page = 0
+        vglr._active_effects = [1, 4]
+        vglr._reset_held.clear()
+        vglr._reset_combo_active = False
+        vglr._reset_solo_note = None
+
+    def tearDown(self):
+        vglr._monotonic = self._old_clock
+
+    def test_solo_bank_and_mute_still_work_on_release(self):
+        _note(vglr.BANK_R, True)
+        self.assertEqual(vglr._current_bank, 3)
+        _note(vglr.BANK_R, False)
+        self.assertEqual(vglr._current_bank, 4)
+
+        vglr._active_effects = []
+        _note(vglr.MUTE[1], True)
+        self.assertEqual(vglr._active_effects, [1])
+        _note(vglr.MUTE[0], True)
+        self.assertEqual(vglr._active_effects, [1])
+        _note(vglr.MUTE[0], False)
+        self.assertEqual(vglr._active_effects, [0, 1])
+
+    def test_combo_does_not_change_bank_or_effects(self):
+        # Holding the restart chord used to switch banks and toggle MUTE-1
+        # immediately, so an aborted restart left the projector on the wrong clip.
+        for note in (vglr.MUTE[0], vglr.BANK_L, vglr.BANK_R):
+            _note(note, True)
+            self.assertEqual(vglr._current_bank, 3)
+            self.assertEqual(vglr._active_effects, [1, 4])
+        for note in (vglr.BANK_R, vglr.BANK_L, vglr.MUTE[0]):
+            _note(note, False)
+        self.assertEqual(vglr._current_bank, 3)
+        self.assertEqual(vglr._current_slot, 2)
+        self.assertEqual(vglr._active_effects, [1, 4])
+        self.assertFalse(vglr._reset_combo_active)
+        self.assertIsNone(vglr._reset_solo_note)
+        self.assertEqual(vglr._reset_held, {})
+
+    def test_long_solo_bank_press_still_changes_bank(self):
+        # The 10s stale-hold eviction forgets a stuck note so it cannot arm the
+        # chord. A finger that is actually still down must bank on release.
+        vglr._monotonic = lambda: 0.0
+        _note(vglr.BANK_R, True)
+        vglr._monotonic = lambda: 11.0
+        self.assertFalse(vglr._poll_reset_combo())
+        self.assertNotIn(vglr.BANK_R, vglr._reset_held)
+        self.assertEqual(vglr._current_bank, 3)
+        _note(vglr.BANK_R, False)
+        self.assertEqual(vglr._current_bank, 4)
+
+    def test_bank1_chord_does_not_advance_to_bank2(self):
+        vglr._current_bank = 1
+        _note(vglr.BANK_L, True)
+        _note(vglr.BANK_R, True)
+        _note(vglr.MUTE[0], True)
+        _note(vglr.MUTE[0], False)
+        _note(vglr.BANK_R, False)
+        _note(vglr.BANK_L, False)
+        self.assertEqual(vglr._current_bank, 1)
+
+    def test_poll_fires_only_after_full_hold(self):
+        start = 5000.0
+        vglr._reset_held = {note: start for note in vglr._RESET_NOTES}
+        vglr._monotonic = lambda: start + 1.9
+        self.assertFalse(vglr._poll_reset_combo())
+        vglr._monotonic = lambda: start + 2.0
+        self.assertTrue(vglr._poll_reset_combo())
+
+    def test_note_off_during_poll_is_not_written_back(self):
+        # Snapshot-then-monotonic-then-update restored released notes, because
+        # monotonic() drops the GIL and the MIDI thread can pop them in between.
+        start = 8000.0
+        vglr._reset_held = {note: start for note in vglr._RESET_NOTES}
+
+        def release_during_clock():
+            vglr._reset_held.clear()
+            return start + 1.5
+
+        vglr._monotonic = release_during_clock
+        self.assertFalse(vglr._poll_reset_combo())
+        self.assertEqual(vglr._reset_held, {})
+
+        vglr._monotonic = lambda: start + 3.0
+        self.assertFalse(vglr._poll_reset_combo())
+        self.assertEqual(vglr._reset_held, {})
+
+    def test_stale_press_is_forgotten(self):
+        vglr._reset_held[vglr.BANK_L] = 0.0
+        vglr._reset_held[vglr.BANK_R] = 10.5
+        vglr._monotonic = lambda: 11.0
+        self.assertFalse(vglr._poll_reset_combo())
+        self.assertNotIn(vglr.BANK_L, vglr._reset_held)
+        self.assertIn(vglr.BANK_R, vglr._reset_held)
 
 
 if __name__ == "__main__":
