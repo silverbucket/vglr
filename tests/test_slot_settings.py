@@ -166,5 +166,60 @@ class SlotSettingsTests(unittest.TestCase):
         self.assertEqual(vglr._effect_params[7]["param_a"], 0.1)
 
 
+class AudioOpenTests(unittest.TestCase):
+    def setUp(self):
+        self._old = getattr(vglr.sd, "InputStream", None)
+
+    def tearDown(self):
+        if self._old is None:
+            if hasattr(vglr.sd, "InputStream"):
+                del vglr.sd.InputStream
+        else:
+            vglr.sd.InputStream = self._old
+
+    def test_missing_device_does_not_raise(self):
+        class _Boom:
+            def __init__(self, *args, **kwargs):
+                raise OSError("Invalid device [PaErrorCode -9996]")
+
+        vglr.sd.InputStream = _Boom
+        self.assertIsNone(vglr._open_audio_stream())
+
+    def test_start_failure_closes_stream(self):
+        closed = []
+
+        class _Stream:
+            def start(self):
+                raise RuntimeError("Device unavailable")
+
+            def close(self):
+                closed.append(True)
+
+        vglr.sd.InputStream = lambda *args, **kwargs: _Stream()
+        self.assertIsNone(vglr._open_audio_stream())
+        self.assertEqual(closed, [True])
+
+    def test_success_uses_configured_device(self):
+        seen = {}
+
+        class _Stream:
+            def start(self):
+                seen["started"] = True
+
+        def _ctor(*args, **kwargs):
+            seen["kwargs"] = kwargs
+            return _Stream()
+
+        vglr.sd.InputStream = _ctor
+        stream = vglr._open_audio_stream()
+        self.assertIsInstance(stream, _Stream)
+        self.assertTrue(seen["started"])
+        self.assertEqual(seen["kwargs"]["device"], vglr.AUDIO_DEVICE)
+        self.assertEqual(seen["kwargs"]["channels"], 2)
+        self.assertEqual(seen["kwargs"]["samplerate"], vglr.SAMPLE_RATE)
+        self.assertEqual(seen["kwargs"]["blocksize"], vglr.BLOCK_SIZE)
+        self.assertIs(seen["kwargs"]["callback"], vglr._audio_callback)
+
+
 if __name__ == "__main__":
     unittest.main()

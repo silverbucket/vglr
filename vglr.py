@@ -441,6 +441,34 @@ def _audio_callback(indata, frames, time_info, status):
         _bands['stereo_width'] += SMOOTH * (width  - _bands['stereo_width'])
 
 
+def _open_audio_stream():
+    """Open the configured input, or None if that device cannot be started.
+
+    AUDIO_DEVICE is a sounddevice index. It stops matching the Zoom interface
+    when USB enumeration changes or the recorder is unplugged. Raising from
+    window init exited the process, and systemd Restart=on-failure brought it
+    straight back, so the projector never stayed up and MIDI never became
+    usable. Picture and control still run; with no samples the intensity
+    envelope stays at silence and the shaders pass the clip through.
+    """
+    stream = None
+    try:
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=2, dtype='float32',
+            blocksize=BLOCK_SIZE, device=AUDIO_DEVICE, callback=_audio_callback,
+        )
+        stream.start()
+        return stream
+    except Exception as exc:
+        print(f"WARNING: audio input disabled: {exc}", flush=True)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        return None
+
+
 # ── GL ────────────────────────────────────────────────────────────────────────
 VERT = """
 #version 140
@@ -569,11 +597,7 @@ class VGLRApp(mglw.WindowConfig):
         threading.Thread(target=_decode_loop, daemon=True).start()
         threading.Thread(target=_midi_loop, daemon=True).start()
 
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=2, dtype='float32',
-            blocksize=BLOCK_SIZE, device=AUDIO_DEVICE, callback=_audio_callback,
-        )
-        self._stream.start()
+        self._stream = _open_audio_stream()
 
     def _set_effect_uniforms(self, prog, t, intensity, params, bass, mid, treble, beat, sw):
         _set_uniform(prog, 'resolution',   self.wnd.size)
