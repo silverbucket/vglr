@@ -141,6 +141,18 @@ class SlotSettingsTests(unittest.TestCase):
         vglr.av.open = lambda path: _Container()
         self.assertEqual(vglr._probe_video("clip.mp4"), (1280, 720, 24.0))
 
+    def test_session_texture_size_rejects_dimensions_the_pi_cannot_allocate(self):
+        # Pi 5 V3D GL_MAX_TEXTURE_SIZE is 4096. A 5.3K boot clip (GoPro and
+        # similar cameras) probes successfully, then texture allocation raises
+        # inside window init — before MIDI exists — and systemd restart-loops.
+        self.assertEqual(vglr._session_texture_size(5312, 2988), (1280, 720))
+        self.assertEqual(vglr._session_texture_size(2160, 5312), (1280, 720))
+        self.assertEqual(vglr._session_texture_size(4097, 720), (1280, 720))
+        # At and under the limit, keep the probed size (1080p and DCI 4K).
+        self.assertEqual(vglr._session_texture_size(1920, 1080), (1920, 1080))
+        self.assertEqual(vglr._session_texture_size(4096, 2160), (4096, 2160))
+        self.assertEqual(vglr._session_texture_size(1280, 720), (1280, 720))
+
     def test_probe_video_rejects_unreadable_file(self):
         def _open(path):
             raise OSError("truncated")

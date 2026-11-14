@@ -755,6 +755,21 @@ def _probe_video(path: str):
         return width, height, fps
 
 
+# Pi 5 Mesa V3D reports GL_MAX_TEXTURE_SIZE = 4096. A larger boot clip raises
+# inside window init, before the MIDI thread exists, and systemd
+# Restart=on-failure crash-loops the show. The texture size is fixed for the
+# whole session, so a later slot change cannot recover. Use the 720p output
+# size instead; the decode thread reformats every frame to it.
+_MAX_TEXTURE_SIZE = 4096
+_FALLBACK_W, _FALLBACK_H = 1280, 720
+
+
+def _session_texture_size(width: int, height: int) -> tuple[int, int]:
+    if width > _MAX_TEXTURE_SIZE or height > _MAX_TEXTURE_SIZE:
+        return _FALLBACK_W, _FALLBACK_H
+    return width, height
+
+
 # ── startup ───────────────────────────────────────────────────────────────────
 _select_slot(1, 1)
 if _requested_video is None and os.path.exists(FALLBACK_VIDEO):
@@ -766,11 +781,20 @@ if _requested_video is None and os.path.exists(FALLBACK_VIDEO):
 # could not switch to another slot. Keep going; the decode thread retries.
 # Texture size is fixed for the whole session and every clip is reformatted to
 # it, so the fallback matches the 720p output the Pi can actually sustain.
-_init_w, _init_h, _init_fps = 1280, 720, 30.0
+_init_w, _init_h, _init_fps = _FALLBACK_W, _FALLBACK_H, 30.0
 if _requested_video:
     try:
-        _init_w, _init_h, _init_fps = _probe_video(_requested_video)
-        print(f"video: {_init_w}x{_init_h} @ {_init_fps:.3f} fps")
+        _probe_w, _probe_h, _init_fps = _probe_video(_requested_video)
+        _init_w, _init_h = _session_texture_size(_probe_w, _probe_h)
+        if (_init_w, _init_h) != (_probe_w, _probe_h):
+            print(
+                f"WARNING: {_requested_video} is {_probe_w}x{_probe_h} "
+                f"@ {_init_fps:.3f} fps, above the GPU texture limit "
+                f"({_MAX_TEXTURE_SIZE}); using {_init_w}x{_init_h}",
+                flush=True,
+            )
+        else:
+            print(f"video: {_init_w}x{_init_h} @ {_init_fps:.3f} fps")
     except Exception as exc:
         print(f"WARNING: could not probe {_requested_video}: {exc}", flush=True)
         print("WARNING: starting anyway — switch slot if this file is bad", flush=True)
